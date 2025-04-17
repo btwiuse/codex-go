@@ -161,7 +161,8 @@ func NewOpenAIAgent(cfg *config.Config) (*OpenAIAgent, error) {
 }
 
 // SendMessage sends a message to OpenAI and streams the response
-func (a *OpenAIAgent) SendMessage(ctx context.Context, messages []Message, handler ResponseHandler) error {
+// It returns true if the stream finished requesting tool calls, false otherwise.
+func (a *OpenAIAgent) SendMessage(ctx context.Context, messages []Message, handler ResponseHandler) (bool, error) {
 	a.mu.Lock()
 	// Cancel any ongoing request
 	if a.cancelFunc != nil {
@@ -210,13 +211,15 @@ func (a *OpenAIAgent) SendMessage(ctx context.Context, messages []Message, handl
 		// Handle Tool results
 		if msg.Role == openai.ChatMessageRoleTool {
 			apiMsg.ToolCallID = msg.ToolCallID
-			// The 'Name' field is NOT part of ChatCompletionMessage for role 'tool' in go-openai
-			// It's implicitly associated via the ToolCallID. The content contains the result.
-			// Our history saving in history.go IS correct by adding Name to OUR struct for tracking.
 		}
 
 		openAIMessages = append(openAIMessages, apiMsg)
 	}
+
+	// --- ADD LOGGING ---
+	historyForAPILog, _ := json.MarshalIndent(openAIMessages, "", "  ")
+	logAgentDebug("[DEBUG] Agent.SendMessage: History being sent to API:\n%s", string(historyForAPILog))
+	// --- END LOGGING ---
 
 	// Create the request
 	req := openai.ChatCompletionRequest{
@@ -231,38 +234,33 @@ func (a *OpenAIAgent) SendMessage(ctx context.Context, messages []Message, handl
 	startTime := time.Now()
 
 	logAgentDebug("[DEBUG] Agent.SendMessage: Creating stream request...")
-	// Make the streaming request
 	stream, err := a.client.CreateChatCompletionStream(a.currentContext, req)
 	if err != nil {
 		logAgentDebug("[ERROR] Agent.SendMessage: Error creating stream: %v", err)
-		return fmt.Errorf("error creating chat completion stream: %w", err)
+		return false, fmt.Errorf("error creating chat completion stream: %w", err) // Return false on error
 	}
 	defer stream.Close()
 	logAgentDebug("[DEBUG] Agent.SendMessage: Stream created successfully. Starting Recv() loop.")
 
-	// Track function call state
-	var currentFunctionCall *openai.FunctionCall
-	var currentFunctionCallID string
+	accumulatingToolCalls := make(map[string]*openai.FunctionCall)
 	var currentContent string
-	var currentRole string = "assistant"
+	currentRole := openai.ChatMessageRoleAssistant
+	streamEndedWithToolCall := false // Flag
 
 	// Process the stream
 	for {
 		logAgentDebug("[DEBUG] Agent.SendMessage: Calling stream.Recv()...")
 		response, err := stream.Recv()
-		if errors.Is(err, io.EOF) {
-			// Send a debug system message
-			logAgentDebug("[DEBUG] Agent.SendMessage: Received EOF from stream.")
-			a.AddSystemMessage("Stream complete - EOF received")
-			break // Exit loop on EOF
-		}
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				logAgentDebug("[DEBUG] Agent.SendMessage: Received EOF from stream.")
+				break // Exit loop on EOF
+			}
 			logAgentDebug("[ERROR] Agent.SendMessage: Error receiving from stream: %v", err)
-			return fmt.Errorf("error receiving from stream: %w", err)
+			return false, fmt.Errorf("error receiving from stream: %w", err) // Return false on error
 		}
 		logAgentDebug("[DEBUG] Agent.SendMessage: stream.Recv() successful. Choices: %d", len(response.Choices))
 
-		// Handle content in the response
 		if len(response.Choices) > 0 {
 			choice := response.Choices[0]
 			logAgentDebug("[DEBUG] Agent.SendMessage: Processing choice 0. Delta Content: %t, Delta ToolCalls: %t, FinishReason: %s", choice.Delta.Content != "", choice.Delta.ToolCalls != nil, choice.FinishReason)
@@ -271,73 +269,138 @@ func (a *OpenAIAgent) SendMessage(ctx context.Context, messages []Message, handl
 			if choice.Delta.Content != "" {
 				currentContent += choice.Delta.Content
 				logAgentDebug("[DEBUG] Agent.SendMessage: Calling handler with type 'message'. Current content length: %d", len(currentContent))
-				handler(ResponseItem{
+				itemToSend := ResponseItem{
 					Type: "message",
 					Message: &Message{
 						Role:    currentRole,
 						Content: currentContent,
 					},
 					ThinkingDuration: time.Since(startTime).Milliseconds(),
-				})
+				}
+				jsonData, err := json.Marshal(itemToSend)
+				if err != nil {
+					logAgentDebug("[ERROR] Agent.SendMessage: Failed to marshal message item: %v", err)
+				} else {
+					handler(string(jsonData))
+				}
 			}
 
 			// Handle accumulating tool calls data
 			if choice.Delta.ToolCalls != nil && len(choice.Delta.ToolCalls) > 0 {
 				logAgentDebug("[DEBUG] Agent.SendMessage: Processing Delta.ToolCalls.")
-				toolCall := choice.Delta.ToolCalls[0]
-
-				if currentFunctionCall == nil {
-					logAgentDebug("[DEBUG] Agent.SendMessage: Initializing new function call. Name: %s, ID: %s", toolCall.Function.Name, toolCall.ID)
-					currentFunctionCall = &openai.FunctionCall{
-						Name:      toolCall.Function.Name,
-						Arguments: toolCall.Function.Arguments,
+				for _, toolCallChunk := range choice.Delta.ToolCalls {
+					if toolCallChunk.ID == "" {
+						// Sometimes chunks only have args without ID, append to the most recent ID?
+						// This requires careful handling, maybe assume it belongs to the last seen ID.
+						// For now, let's focus on chunks with IDs.
+						continue
 					}
-					currentFunctionCallID = toolCall.ID
-				} else {
-					logAgentDebug("[DEBUG] Agent.SendMessage: Appending to existing function call arguments.")
-					currentFunctionCall.Arguments += toolCall.Function.Arguments
+					if _, exists := accumulatingToolCalls[toolCallChunk.ID]; !exists {
+						// First time seeing this ID, initialize
+						logAgentDebug("[DEBUG] Agent.SendMessage: Initializing new tool call buffer for ID: %s", toolCallChunk.ID)
+						accumulatingToolCalls[toolCallChunk.ID] = &openai.FunctionCall{Name: toolCallChunk.Function.Name}
+					}
+					// Append arguments
+					if toolCallChunk.Function.Arguments != "" {
+						logAgentDebug("[DEBUG] Agent.SendMessage: Appending arguments chunk '%s' to tool call ID: %s", toolCallChunk.Function.Arguments, toolCallChunk.ID)
+						logAgentDebug("[DEBUG] Agent.SendMessage: Appending arguments to tool call ID: %s", toolCallChunk.ID)
+						accumulatingToolCalls[toolCallChunk.ID].Arguments += toolCallChunk.Function.Arguments
+					}
 				}
 			}
 
-			// Check for FinishReason SEPARATELY
-			// Send the completed function call if FinishReason is tool_calls AND we have accumulated call data
-			if choice.FinishReason == "tool_calls" && currentFunctionCall != nil {
-				logAgentDebug("[DEBUG] Agent.SendMessage: FinishReason is 'tool_calls' and currentFunctionCall is not nil. Preparing function call item.")
-				functionCall := &FunctionCall{
-					Name:      currentFunctionCall.Name,
-					Arguments: currentFunctionCall.Arguments,
-					ID:        currentFunctionCallID,
+			// Check for FinishReason
+			if choice.FinishReason != "" {
+				if choice.FinishReason == "tool_calls" {
+					streamEndedWithToolCall = true // Set flag
+					logAgentDebug("[DEBUG] Agent.SendMessage: FinishReason is 'tool_calls'.")
+
+					// Create the assistant message containing the tool calls
+					assistantMsgToolCalls := []ToolCall{}
+					for id, completedCall := range accumulatingToolCalls {
+						// --- ENSURE VALID JSON ARGUMENTS ---
+						args := completedCall.Arguments
+						if args == "" {
+							args = "{}" // Default to empty JSON object if args are empty string
+							logAgentDebug("[DEBUG] Agent.SendMessage: Accumulated arguments were empty, defaulting to '{}' for history.")
+						}
+						// --- END ENSURE VALID JSON ARGUMENTS ---
+
+						assistantMsgToolCalls = append(assistantMsgToolCalls, ToolCall{
+							ID:   id,
+							Type: string(openai.ToolTypeFunction), // Assuming function type
+							Function: FunctionCall{
+								Name:      completedCall.Name,
+								Arguments: args, // Use the potentially defaulted args
+							},
+						})
+					}
+
+					// Add this assistant message to history NOW
+					if a.history != nil {
+						a.history.AddMessage(Message{
+							Role:      openai.ChatMessageRoleAssistant,
+							ToolCalls: assistantMsgToolCalls,
+							// Content should be empty/nil when tool calls are present
+						})
+						logAgentDebug("[DEBUG] Agent.SendMessage: Added assistant message with ToolCalls to history.")
+					} else {
+						logAgentDebug("[ERROR] Agent.SendMessage: History is nil, cannot add assistant message with ToolCalls.")
+						// Handle error appropriately, maybe return?
+					}
+
+					for id, completedCall := range accumulatingToolCalls {
+						functionCall := &FunctionCall{
+							Name:      completedCall.Name,
+							Arguments: completedCall.Arguments,
+							ID:        id, // Use the map key as the ID
+						}
+
+						logAgentDebug("[DEBUG] Agent.SendMessage: Calling handler with type 'function_call'. Name: %s, Args: '%s', ID: %s", functionCall.Name, functionCall.Arguments, functionCall.ID)
+						// Create the item
+						itemToSend := ResponseItem{
+							Type:             "function_call",
+							FunctionCall:     &FunctionCall{Name: functionCall.Name, Arguments: functionCall.Arguments, ID: functionCall.ID},
+							ThinkingDuration: time.Since(startTime).Milliseconds(),
+						}
+						// Marshal and send JSON string via handler
+						jsonData, err := json.Marshal(itemToSend)
+						if err != nil {
+							logAgentDebug("[ERROR] Agent.SendMessage: Failed to marshal function_call item: %v", err)
+							// Consider sending an error message back to the app
+						} else {
+							handler(string(jsonData))
+							logAgentDebug("[DEBUG] Agent.SendMessage: Sent function_call item as JSON string.")
+						}
+					}
+					// Clear the accumulated calls after sending
+					accumulatingToolCalls = make(map[string]*openai.FunctionCall)
+				} else {
+					logAgentDebug("[DEBUG] Agent.SendMessage: FinishReason is '%s'.", choice.FinishReason)
 				}
-
-				logAgentDebug("[DEBUG] Agent.SendMessage: Calling handler with type 'function_call'. Name: %s, Args Len: %d, ID: %s", functionCall.Name, len(functionCall.Arguments), functionCall.ID)
-				handler(ResponseItem{
-					Type:             "function_call",
-					FunctionCall:     functionCall,
-					ThinkingDuration: time.Since(startTime).Milliseconds(),
-				})
-
-				currentFunctionCall = nil
-				currentFunctionCallID = ""
+				// Don't break here, let EOF break after processing this chunk.
 			}
 		}
-	}
+	} // End stream processing loop
 
 	logAgentDebug("[DEBUG] Agent.SendMessage: Exited Recv() loop.")
+
 	// If we have a complete message, add it to history
-	if currentContent != "" {
-		logAgentDebug("[DEBUG] Agent.SendMessage: Adding final assistant message to history. Length: %d", len(currentContent))
-		a.history.AddMessage(Message{
-			Role:    currentRole,
-			Content: currentContent,
-		})
+	// --- REMOVE/COMMENT OUT THIS BLOCK - Handled above for tool calls, and correct for text ---
+	// if currentContent != "" {
+	// 	logAgentDebug("[DEBUG] Agent.SendMessage: Adding final assistant message to history. Length: %d", len(currentContent))
+	// 	a.history.AddMessage(Message{
+	// 		Role:    currentRole,
+	// 		Content: currentContent,
+	// 	})
+	//
+	// 	// Save history to disk
+	// 	logAgentDebug("[DEBUG] Agent.SendMessage: Saving history to disk.")
+	// 	a.history.Save(a.historyOpts.HistoryPath)
+	// }
 
-		// Save history to disk
-		logAgentDebug("[DEBUG] Agent.SendMessage: Saving history to disk.")
-		a.history.Save(a.historyOpts.HistoryPath)
-	}
-
-	logAgentDebug("[DEBUG] Agent.SendMessage: Function returning nil error.")
-	return nil
+	logAgentDebug("[DEBUG] Agent.SendMessage: Function returning. Stream ended with tool call: %t", streamEndedWithToolCall)
+	return streamEndedWithToolCall, nil // Return the flag and nil error
 }
 
 // SendFileChange sends a file change to the AI for approval
@@ -411,50 +474,7 @@ func (a *OpenAIAgent) SendFunctionResult(ctx context.Context, callID, functionNa
 	// 	a.mu.Unlock()
 	// }()
 
-	// 1. Add the tool result message to history
-	// Retrieve necessary arguments from somewhere (need to pass them in or retrieve)
-	// We need the original arguments for the assistant message.
-	// A better approach would be to pass the original FunctionCall details through.
-	// For now, let's try finding it in history (might be incorrect if history was pruned)
-	var originalArgs string
-	if a.history != nil {
-		msgs := a.history.GetMessages()
-		for i := len(msgs) - 1; i >= 0; i-- {
-			if msgs[i].Role == openai.ChatMessageRoleAssistant && len(msgs[i].ToolCalls) > 0 {
-				// Find the matching tool call ID? This assumes only one tool call per assistant msg.
-				for _, tc := range msgs[i].ToolCalls {
-					if tc.ID == callID {
-						originalArgs = tc.Function.Arguments
-						break
-					}
-				}
-			}
-			if originalArgs != "" {
-				break
-			} // Stop searching once found
-		}
-	}
-	if originalArgs == "" {
-		logAgentDebug("[WARN] Agent.SendFunctionResult: Could not find original arguments for ToolCall ID %s in history. Follow-up request might fail.", callID)
-		// We might need to reconstruct arguments or handle this error differently
-		originalArgs = "{}" // Default to empty JSON object?
-	}
-
-	// Create the Assistant message part
-	assistantToolCallMsg := Message{
-		Role: openai.ChatMessageRoleAssistant,
-		ToolCalls: []ToolCall{
-			{
-				ID:   callID, // Use the passed callID
-				Type: "function",
-				Function: FunctionCall{
-					Name:      functionName,
-					Arguments: originalArgs,
-				},
-			},
-		},
-	}
-
+	// 1. Create the tool result message to add to history
 	var content map[string]interface{}
 	if success {
 		content = map[string]interface{}{"output": output}
@@ -470,8 +490,8 @@ func (a *OpenAIAgent) SendFunctionResult(ctx context.Context, callID, functionNa
 	}
 
 	if a.history != nil {
-		// Add BOTH messages to history IN ORDER
-		a.history.AddMessage(assistantToolCallMsg)
+		// Add ONLY the tool result message to history. The assistant message
+		// with the tool call request is already present from SendMessage.
 		a.history.AddMessage(toolResultMessage)
 		logAgentDebug("[DEBUG] Agent.SendFunctionResult: Tool result message added to history.")
 	} else {
@@ -512,9 +532,15 @@ func (a *OpenAIAgent) SendFunctionResult(ctx context.Context, callID, functionNa
 		}
 		if msg.Role == openai.ChatMessageRoleTool {
 			apiMsg.ToolCallID = msg.ToolCallID
+			apiMsg.Name = msg.Name // Set Name ONLY for tool role
 		}
 		openAIMessages = append(openAIMessages, apiMsg)
 	}
+
+	// --- ADD LOGGING ---
+	historyForAPILog, _ := json.MarshalIndent(openAIMessages, "", "  ")
+	logAgentDebug("[DEBUG] Agent.SendFunctionResult: History being sent to API:\n%s", string(historyForAPILog))
+	// --- END LOGGING ---
 
 	req := openai.ChatCompletionRequest{
 		Model:       a.config.Model,
@@ -562,14 +588,20 @@ func (a *OpenAIAgent) SendFunctionResult(ctx context.Context, callID, functionNa
 			if choice.Delta.Content != "" {
 				currentContent += choice.Delta.Content
 				logAgentDebug("[DEBUG] Agent.SendFunctionResult: Calling handler with type 'message'. Current content length: %d", len(currentContent))
-				handler(ResponseItem{
+				itemToSend := ResponseItem{
 					Type: "message",
 					Message: &Message{
 						Role:    currentRole,
 						Content: currentContent,
 					},
-					ThinkingDuration: time.Since(startTime).Milliseconds(), // Duration for this part
-				})
+					ThinkingDuration: time.Since(startTime).Milliseconds(),
+				}
+				jsonData, err := json.Marshal(itemToSend)
+				if err != nil {
+					logAgentDebug("[ERROR] Agent.SendFunctionResult: Failed to marshal message item: %v", err)
+				} else {
+					handler(string(jsonData))
+				}
 			}
 
 			// Handle accumulating tool calls data (for potential recursive calls)
@@ -593,18 +625,51 @@ func (a *OpenAIAgent) SendFunctionResult(ctx context.Context, callID, functionNa
 			// Check for FinishReason SEPARATELY (for potential recursive calls)
 			if choice.FinishReason == "tool_calls" && currentFunctionCall != nil {
 				logAgentDebug("[DEBUG] Agent.SendFunctionResult: FinishReason is 'tool_calls' (nested). Preparing function call item.")
-				functionCall := &FunctionCall{
+
+				// --- BEGIN FIX: Add Assistant message for nested tool call ---
+				nestedToolCalls := []ToolCall{
+					{
+						ID:   currentFunctionCallID,
+						Type: string(openai.ToolTypeFunction), // Assuming function
+						Function: FunctionCall{
+							Name:      currentFunctionCall.Name,
+							Arguments: currentFunctionCall.Arguments, // Already accumulated
+						},
+					},
+				}
+				// Add this assistant message to history NOW
+				if a.history != nil {
+					a.history.AddMessage(Message{
+						Role:      openai.ChatMessageRoleAssistant,
+						ToolCalls: nestedToolCalls,
+					})
+					logAgentDebug("[DEBUG] Agent.SendFunctionResult: Added assistant message with NESTED ToolCalls to history.")
+				} else {
+					logAgentDebug("[ERROR] Agent.SendFunctionResult: History is nil, cannot add nested assistant message with ToolCalls.")
+				}
+				// --- END FIX ---
+
+				functionCall := &FunctionCall{ // Prepare item for handler
 					Name:      currentFunctionCall.Name,
 					Arguments: currentFunctionCall.Arguments,
 					ID:        currentFunctionCallID,
 				}
 
-				logAgentDebug("[DEBUG] Agent.SendFunctionResult: Calling handler with type 'function_call' (nested). Name: %s, Args Len: %d, ID: %s", functionCall.Name, len(functionCall.Arguments), functionCall.ID)
-				handler(ResponseItem{
+				logAgentDebug("[DEBUG] Agent.SendFunctionResult: Calling handler with type 'function_call' (nested). Name: %s, Args: '%s', ID: %s", functionCall.Name, functionCall.Arguments, functionCall.ID)
+				itemToSend := ResponseItem{
 					Type:             "function_call",
-					FunctionCall:     functionCall,
+					FunctionCall:     &FunctionCall{Name: functionCall.Name, Arguments: functionCall.Arguments, ID: functionCall.ID},
 					ThinkingDuration: time.Since(startTime).Milliseconds(),
-				})
+				}
+				// Marshal and send JSON string via handler
+				jsonData, err := json.Marshal(itemToSend)
+				if err != nil {
+					logAgentDebug("[ERROR] Agent.SendFunctionResult: Failed to marshal function_call item: %v", err)
+					// Consider sending an error message back to the app
+				} else {
+					handler(string(jsonData))
+					logAgentDebug("[DEBUG] Agent.SendFunctionResult: Sent function_call item as JSON string.")
+				}
 
 				// Reset for next potential call in this stream
 				currentFunctionCall = nil
@@ -625,9 +690,23 @@ func (a *OpenAIAgent) SendFunctionResult(ctx context.Context, callID, functionNa
 		}
 	}
 
-	// Indicate completion of the entire sequence? The original SendMessage completion/error
-	// signal might be sufficient if we don't return an error here.
-	// Note: The handler clearing is handled by the defer in SendMessage.
+	// --- FIX: Signal completion of the follow-up stream ---
+	// If we finished processing the stream and the last action wasn't requesting another tool call,
+	// signal completion back to the App.
+	if currentFunctionCall == nil { // If we are not expecting another tool call
+		logAgentDebug("[DEBUG] Agent.SendFunctionResult: Follow-up stream finished without further tool calls. Sending completion signal.")
+		// Use the handler to send the new completion message
+		completionItem := ResponseItem{Type: "followup_complete"} // Use a unique type
+		jsonData, err := json.Marshal(completionItem)
+		if err != nil {
+			logAgentDebug("[ERROR] Agent.SendFunctionResult: Failed to marshal followup_complete item: %v", err)
+		} else {
+			handler(string(jsonData))
+		}
+	} else {
+		logAgentDebug("[DEBUG] Agent.SendFunctionResult: Follow-up stream ended with pending tool call. NOT sending completion signal yet.")
+	}
+
 	return nil
 }
 

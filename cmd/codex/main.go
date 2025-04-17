@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -230,15 +231,24 @@ func runQuietMode(ai *agent.OpenAIAgent, prompt string, cfg *config.Config) {
 	// Send message and collect response
 	var finalResponse string
 
-	handler := func(item agent.ResponseItem) {
+	handler := func(itemJSON string) {
+		// Unmarshal
+		var item agent.ResponseItem
+		if err := json.Unmarshal([]byte(itemJSON), &item); err != nil {
+			// In quiet mode, maybe just log error to stderr?
+			fmt.Fprintf(os.Stderr, "[ERROR] Quiet mode failed to unmarshal response: %v\n", err)
+			return
+		}
+
 		if item.Type == "message" && item.Message != nil && item.Message.Role == "assistant" {
-			// The content in each item is the *full* message so far
+			// Content in each item is the full message so far.
 			finalResponse = item.Message.Content
 		}
-		// We don't print anything here, just collect the last full message
+		// We don't print streamed parts in quiet mode, just collect the final full message.
 	}
 
-	if err := ai.SendMessage(ctx, messages, handler); err != nil {
+	_, err := ai.SendMessage(ctx, messages, handler)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

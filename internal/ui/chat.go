@@ -903,3 +903,10 @@ func (m *ChatModel) ForceUpdateViewport() {
 		m.updateViewport()
 	}
 }
+
+// ClearMessages clears the locally displayed messages in the UI.
+func (m *ChatModel) ClearMessages() {
+	m.messages = []Message{}
+	// Optionally, force a viewport update after clearing
+	m.ForceUpdateViewport()
+}

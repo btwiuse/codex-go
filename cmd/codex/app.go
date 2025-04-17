@@ -34,6 +34,8 @@ type agentErrorMsg struct {
 
 type agentStreamCompleteMsg struct{}
 
+type agentFollowUpCompleteMsg struct{}
+
 // Represents a function result to be sent back to the agent
 type sendFunctionResultMsg struct {
 	ctx          context.Context
@@ -70,6 +72,7 @@ type App struct {
 
 	agentMsgChan      chan tea.Msg // Channel for agent messages
 	isFirstAgentChunk bool         // Track if we are processing the first chunk of a stream
+	isAgentProcessing bool         // Track if the agent is busy with a request/response cycle
 }
 
 // AppRollout represents a saved session that can be loaded later
@@ -142,14 +145,24 @@ func NewApp(config *config.Config) (*App, error) {
 
 // Init initializes the application model
 func (app *App) Init() tea.Cmd {
-	// Initialize the sub-model and potentially other components
-	return app.ChatModel.Init()
+	// Start the dedicated channel listener command
+	return tea.Batch(app.ChatModel.Init(), app.listenForAgentMessages())
+}
+
+// listenForAgentMessages returns a command that continuously listens on the
+// agent message channel and sends received messages back to the App's Update loop.
+func (app *App) listenForAgentMessages() tea.Cmd {
+	return func() tea.Msg {
+		msg := <-app.agentMsgChan // Block and wait for the next message
+		logDebug("[DEBUG] listenForAgentMessages: Received %T from channel, returning to Update.", msg)
+		// --- Revert: Return the message directly ---
+		return msg
+	}
 }
 
 // Update handles messages for the application model
 func (app *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmds []tea.Cmd
-	var cmd tea.Cmd
+	var cmd tea.Cmd // Keep cmd for potential non-agent commands from ChatModel.Update
 	var agentMessageHandled bool = false
 	var skipChatModelUpdate bool = false // Use flag
 
@@ -173,58 +186,105 @@ func (app *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// --- NEW: Handle submit message from ChatModel ---
 	case ui.UserInputSubmitMsg:
-		// fmt.Fprintf(os.Stderr, "App.Update: UserInputSubmitMsg received!\n")
-		// Add user message UI (ChatModel already cleared input)
-		app.ChatModel.AddUserMessage(msg.Content)
-		app.ChatModel.StartThinking() // Start thinking UI
-		app.isFirstAgentChunk = true  // Reset chunk state
-		// Return command to start background agent process
-		cmds = append(cmds, app.listenAgentStreamCmd(msg.Content))
-		skipChatModelUpdate = true // This message is fully handled here
+		// --- BEGIN /clear and /help handling ---
+		if strings.HasPrefix(msg.Content, "/") {
+			command := strings.TrimSpace(msg.Content)
+			if command == "/clear" {
+				logDebug("[DEBUG] User command: /clear")
+				app.Agent.ClearHistory()                                // Clear agent's internal history
+				app.ChatModel.ClearMessages()                           // Clear UI messages
+				app.ChatModel.AddSystemMessage("Chat history cleared.") // Notify user
+				skipChatModelUpdate = true
+				cmd = nil // No further command needed immediately
+				// Ensure we don't proceed to agent processing
+			} else if command == "/help" {
+				logDebug("[DEBUG] User command: /help")
+				helpText := `Codex-Go Help:
+  /clear : Clears the current conversation history.
+  /help  : Shows this help message.
+  Ctrl+C : Quits the application.
+  Enter  : Sends your message to the assistant.`
+				app.ChatModel.AddSystemMessage(helpText)
+				skipChatModelUpdate = true
+				cmd = nil // No further command needed immediately
+				// Ensure we don't proceed to agent processing
+			} else {
+				// Unknown command, maybe notify user or just ignore?
+				app.ChatModel.AddSystemMessage(fmt.Sprintf("Unknown command: %s", command))
+				skipChatModelUpdate = true
+				cmd = nil
+			}
+		} else {
+			// --- Not a command, proceed with normal message handling ---
+			// --- FIX: Check if agent is already processing ---
+			if app.isAgentProcessing {
+				logDebug("[WARN] User submitted input while agent is processing. Ignoring.")
+				skipChatModelUpdate = true
+				cmd = nil
+			} else {
+				logDebug("[DEBUG] User submitted input. Starting agent stream.")
+				app.ChatModel.AddUserMessage(msg.Content)
+				app.ChatModel.StartThinking()
+				app.isFirstAgentChunk = true
+				app.isAgentProcessing = true // <-- Set agent busy flag
+				cmd = app.listenAgentStreamCmd(msg.Content)
+				skipChatModelUpdate = true
+			}
+		}
+		// --- END /clear and /help handling ---
 
 	// --- Agent Message Cases (Handled by App) ---
-	case startAgentStreamMsg: // Should likely be removed if UserInputSubmitMsg works
-		// fmt.Fprintf(os.Stderr, "App.Update: WARNING - startAgentStreamMsg received directly?\n")
-		app.isFirstAgentChunk = true
-		cmds = append(cmds, app.listenAgentStreamCmd(msg.content))
-		agentMessageHandled = true
-		skipChatModelUpdate = true // Handled, skip ChatModel.Update
-
 	case agentResponseMsg:
-		cmds = append(cmds, app.handleAgentResponseItem(msg.item))
+		app.handleAgentResponseItem(msg.item)
+		cmd = app.listenForAgentMessages()
 		agentMessageHandled = true
-		skipChatModelUpdate = true // Handled, skip ChatModel.Update
+		skipChatModelUpdate = true
 
 	case agentErrorMsg:
 		app.ChatModel.AddSystemMessage(fmt.Sprintf("Error: %v", msg.err))
 		app.ChatModel.StopThinking()
 		app.isFirstAgentChunk = false
-		// Ensure interaction state is cleaned up
+		app.isAgentProcessing = false // <-- Clear agent busy flag
+		cmd = app.listenForAgentMessages()
 		agentMessageHandled = true
-		skipChatModelUpdate = true // Handled, skip ChatModel.Update
+		skipChatModelUpdate = true
 
-	case agentStreamCompleteMsg:
+	case agentStreamCompleteMsg: // Completion of initial stream WITHOUT tool calls
 		app.ChatModel.StopThinking()
 		app.isFirstAgentChunk = false
-		// Ensure interaction state is cleaned up
+		app.isAgentProcessing = false // <-- Clear agent busy flag
+		cmd = app.listenForAgentMessages()
 		agentMessageHandled = true
-		skipChatModelUpdate = true // Handled, skip ChatModel.Update
+		skipChatModelUpdate = true
+
+	case agentFollowUpCompleteMsg: // Completion of a follow-up stream
+		app.ChatModel.StopThinking()
+		app.isFirstAgentChunk = false
+		app.isAgentProcessing = false // <-- Clear agent busy flag
+		cmd = app.listenForAgentMessages()
+		agentMessageHandled = true
+		skipChatModelUpdate = true
 
 	case sendFunctionResultMsg:
-		cmds = append(cmds, app.sendFunctionResultCmd(msg))
+		app.sendFunctionResultCmd(msg)
+		cmd = app.listenForAgentMessages()
 		agentMessageHandled = true
-		skipChatModelUpdate = true // Handled, skip ChatModel.Update
+		skipChatModelUpdate = true
 
 	}
 
 	// Pass message down to ChatModel ONLY if it wasn't handled above
 	if !skipChatModelUpdate {
 		var updatedChatModel tea.Model
-		updatedChatModel, cmd = app.ChatModel.Update(msg)
+		updatedChatModel, cmd = app.ChatModel.Update(msg) // Assign cmd here
 		if updatedChatModelTyped, ok := updatedChatModel.(ui.ChatModel); ok {
 			app.ChatModel = updatedChatModelTyped
 		}
-		cmds = append(cmds, cmd)
+		// Don't append cmd here if it was already set by a handled message
+	} else if cmd == nil {
+		// If handled BUT no specific cmd was returned (e.g. StopThinking messages)
+		// ensure cmd is nil so we don't Batch an empty command later.
+		// Note: This might need refinement depending on how tea.Batch handles nil cmds
 	}
 
 	// Force viewport update if an agent message modified the state
@@ -232,8 +292,15 @@ func (app *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		app.ChatModel.ForceUpdateViewport()
 	}
 
+	// Return the single command OR batch if necessary (though batching is less likely now)
+	// If cmd is nil from handled messages, tea.Batch(nil) might be okay or need explicit nil return?
+	// Let's return cmd directly for now, assuming non-batch cases are dominant. Check Bubble Tea docs if batching nil is problematic.
+	if cmd != nil {
+		return app, cmd
+	}
+
 	// fmt.Fprintf(os.Stderr, "App.Update finished for msg type: %T\n", msg)
-	return app, tea.Batch(cmds...)
+	return app, nil // Return nil command if nothing else to do
 }
 
 // View renders the application UI
@@ -248,54 +315,76 @@ func (app *App) View() string {
 
 // listenAgentStreamCmd starts the agent stream goroutine which sends messages to app.agentMsgChan
 func (app *App) listenAgentStreamCmd(content string) tea.Cmd {
-	return func() tea.Msg {
-		logDebug("[DEBUG] listenAgentStreamCmd: Starting agent stream goroutine for content: '%s'", content)
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute) // Use a timeout
-			defer cancel()
+	logDebug("[DEBUG] listenAgentStreamCmd: Starting agent stream goroutine for content: '%s'", content)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute) // Use a timeout
+		defer cancel()
 
-			message := agent.Message{Role: "user", Content: content}
+		message := agent.Message{Role: "user", Content: content}
 
-			logDebug("[DEBUG] listenAgentStreamCmd: Goroutine started. Calling Agent.SendMessage...")
-			err := app.Agent.SendMessage(ctx, []agent.Message{message}, func(item agent.ResponseItem) {
-				// Send each response item back via the channel
-				logDebug("[DEBUG] listenAgentStreamCmd: Goroutine received item type '%s' from agent. Sending to channel.", item.Type)
-				app.agentMsgChan <- agentResponseMsg{item: item}
-			})
-			logDebug("[DEBUG] listenAgentStreamCmd: Goroutine finished Agent.SendMessage call. Error: %v", err)
+		logDebug("[DEBUG] listenAgentStreamCmd: Goroutine started. Calling Agent.SendMessage...")
+		streamEndedWithTools, err := app.Agent.SendMessage(ctx, []agent.Message{message}, func(itemJSON string) {
+			// ADD LOG: Log the raw JSON received
+			logDebug("[DEBUG] listenAgentStreamCmd Handler: Received JSON string: '%s'", itemJSON) // Log raw JSON
 
-			// After the stream is done, send completion or error message
+			// Unmarshal the JSON string back into a ResponseItem
+			var item agent.ResponseItem
+			err := json.Unmarshal([]byte(itemJSON), &item)
 			if err != nil {
-				logDebug("[DEBUG] listenAgentStreamCmd: Goroutine sending agentErrorMsg to channel.")
-				app.agentMsgChan <- agentErrorMsg{err: err}
-			} else {
-				logDebug("[DEBUG] listenAgentStreamCmd: Goroutine sending agentStreamCompleteMsg to channel.")
-				app.agentMsgChan <- agentStreamCompleteMsg{}
+				logDebug("[ERROR] listenAgentStreamCmd Handler: Failed to unmarshal ResponseItem JSON: %v", err)
+				// Send an error message back?
+				app.agentMsgChan <- agentErrorMsg{err: fmt.Errorf("failed to unmarshal agent response: %w", err)}
+				return
 			}
-		}()
 
-		// This command finishes immediately after starting the goroutine.
-		// It returns the *next* command, which is to wait for the first message.
-		logDebug("[DEBUG] listenAgentStreamCmd: Returning waitForAgentActivityCmd.")
-		return waitForAgentActivityCmd(app.agentMsgChan)()
-	}
-}
+			// --- FIX: Send specific message based on item.Type ---
+			switch item.Type {
+			case "message", "function_call":
+				// Deep copy FunctionCall if present
+				fcCopy := item.FunctionCall
+				if item.FunctionCall != nil {
+					copiedFC := *item.FunctionCall
+					fcCopy = &copiedFC
+				}
+				itemToSend := agent.ResponseItem{
+					Type:             item.Type,
+					Message:          item.Message,
+					FunctionCall:     fcCopy,
+					ThinkingDuration: item.ThinkingDuration,
+				}
+				logDebug("[DEBUG] listenAgentStreamCmd Handler: Sending agentResponseMsg to channel (Type: %s).", item.Type)
+				app.agentMsgChan <- agentResponseMsg{item: itemToSend}
+			case "followup_complete":
+				logDebug("[DEBUG] listenAgentStreamCmd Handler: Sending agentFollowUpCompleteMsg to channel.")
+				app.agentMsgChan <- agentFollowUpCompleteMsg{}
+			default:
+				logDebug("[WARN] listenAgentStreamCmd Handler: Received unknown item type '%s'. Ignoring.", item.Type)
+			}
+		})
+		logDebug("[DEBUG] listenAgentStreamCmd: Goroutine finished Agent.SendMessage call. Error: %v, EndedWithTools: %t", err, streamEndedWithTools)
 
-// waitForAgentActivityCmd returns a command that waits for the next message on the channel
-func waitForAgentActivityCmd(msgChan chan tea.Msg) tea.Cmd {
-	return func() tea.Msg {
-		logDebug("[DEBUG] waitForAgentActivityCmd: Waiting for message on agentMsgChan...")
-		// This blocks until a message is available
-		msg := <-msgChan
-		logDebug("[DEBUG] waitForAgentActivityCmd: Received message of type %T from agentMsgChan. Returning msg.", msg)
-		return msg
-	}
+		// After the stream is done, send completion or error message
+		if err != nil {
+			logDebug("[DEBUG] listenAgentStreamCmd: Goroutine sending agentErrorMsg to channel.")
+			app.agentMsgChan <- agentErrorMsg{err: err}
+		} else if !streamEndedWithTools {
+			// --- FIX: Send complete ONLY if no error AND didn't end with tools ---
+			logDebug("[DEBUG] listenAgentStreamCmd: Goroutine finished normally and without tool calls. Sending agentStreamCompleteMsg.")
+			app.agentMsgChan <- agentStreamCompleteMsg{}
+		} else {
+			// Stream ended normally requesting tools, do nothing, wait for follow-up.
+			logDebug("[DEBUG] listenAgentStreamCmd: Goroutine finished normally, ended with tool calls. NOT sending agentStreamCompleteMsg.")
+		}
+	}()
+
+	// --- Return nil --- The listener started in Init handles receiving messages
+	logDebug("[DEBUG] listenAgentStreamCmd: Returning nil command.")
+	return nil
 }
 
 // handleAgentResponseItem processes a single response item from the agent
-// It returns a tea.Cmd which might be nil or another command (e.g., waitForAgentActivityCmd)
-func (app *App) handleAgentResponseItem(item agent.ResponseItem) tea.Cmd {
-	var cmds []tea.Cmd
+// --- Returns nil because subsequent actions are triggered by messages on the channel ---
+func (app *App) handleAgentResponseItem(item agent.ResponseItem) /* tea.Cmd - REMOVED */ {
 	logDebug("[DEBUG] App.handleAgentResponseItem received item type: %s", item.Type)
 
 	switch item.Type {
@@ -330,7 +419,16 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) tea.Cmd {
 		} else {
 			logDebug("[WARN] Handling 'message' item, but item.Message is nil.")
 		}
+		// After processing message, wait for the next item from the *same* stream
+		logDebug("[DEBUG] App.handleAgentResponseItem finished processing message.")
+
 	case "function_call":
+		if item.FunctionCall != nil {
+			logDebug("[DEBUG] handleAgentResponseItem received function_call. Args: '%s'", item.FunctionCall.Arguments)
+		} else {
+			logDebug("[DEBUG] handleAgentResponseItem received function_call, but item.FunctionCall is nil.")
+		}
+
 		logDebug("[DEBUG] Handling 'function_call' item.")
 		if item.FunctionCall != nil {
 			app.ChatModel.SetThinkingStatus(fmt.Sprintf("Calling %s...", item.FunctionCall.Name))
@@ -338,11 +436,15 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) tea.Cmd {
 
 			// Add UI element showing the function call is happening
 			app.ChatModel.AddFunctionCallMessage(item.FunctionCall.Name, item.FunctionCall.Arguments)
+			app.ChatModel.ForceUpdateViewport()
 
 			// Add a user-visible message about what's happening
 			statusMsg := fmt.Sprintf("Executing function: %s", item.FunctionCall.Name)
 			app.ChatModel.AddSystemMessage(statusMsg)
 			app.ChatModel.ForceUpdateViewport()
+
+			var agentOutput string
+			var success bool
 
 			// --- Execute Command Case ---
 			if item.FunctionCall.Name == "execute_command" {
@@ -350,34 +452,17 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) tea.Cmd {
 				cmdStr := ""
 				if err := json.Unmarshal([]byte(item.FunctionCall.Arguments), &args); err != nil {
 					logDebug("[ERROR] Failed to unmarshal execute_command args: %v", err)
-					// Handle parsing error
-					errMsg := fmt.Sprintf("Error parsing command args: %v", err)
-					app.ChatModel.AddSystemMessage(errMsg)
-					// Send error result back
-					cmds = append(cmds, app.sendFunctionResultCmd(sendFunctionResultMsg{
-						ctx:          context.Background(),
-						functionName: item.FunctionCall.Name,
-						callID:       item.FunctionCall.ID,
-						originalArgs: item.FunctionCall.Arguments,
-						output:       errMsg,
-						success:      false,
-					}))
+					agentOutput = fmt.Sprintf("Error parsing command args: %v", err)
+					success = false
+					app.ChatModel.AddSystemMessage(agentOutput)
 				} else {
 					var ok bool
 					cmdStr, ok = args["command"].(string)
 					if !ok || cmdStr == "" {
 						logDebug("[ERROR] Missing or invalid 'command' argument in execute_command.")
-						// Handle missing command error
-						errMsg := "Missing command argument for execute_command"
-						app.ChatModel.AddSystemMessage(errMsg)
-						cmds = append(cmds, app.sendFunctionResultCmd(sendFunctionResultMsg{
-							ctx:          context.Background(),
-							functionName: item.FunctionCall.Name,
-							callID:       item.FunctionCall.ID,
-							originalArgs: item.FunctionCall.Arguments,
-							output:       errMsg,
-							success:      false,
-						}))
+						agentOutput = "Missing command argument for execute_command"
+						success = false
+						app.ChatModel.AddSystemMessage(agentOutput)
 					} else {
 						// Execute the command via Sandbox
 						app.ChatModel.SetThinkingStatus(fmt.Sprintf("Executing: %s", cmdStr))
@@ -398,10 +483,11 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) tea.Cmd {
 							Error:    err,             // Include sandbox execution error
 						}
 						app.ChatModel.AddCommandMessage(cmdStr, uiResult)
+						app.ChatModel.ForceUpdateViewport()
 
 						// Determine result/output for agent
-						agentOutput := result.Stdout
-						success := err == nil && result.ExitCode == 0
+						agentOutput = result.Stdout
+						success = err == nil && result.ExitCode == 0
 						if !success {
 							if err != nil {
 								agentOutput = fmt.Sprintf("Execution Error: %v", err)
@@ -409,76 +495,29 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) tea.Cmd {
 								agentOutput = fmt.Sprintf("Command Failed (code %d): %s", result.ExitCode, result.Stderr)
 							}
 						}
-
-						// After displaying command results, expect a new AI response
-						app.isFirstAgentChunk = true
-
-						// Show a message that we're sending results back to the assistant
-						app.ChatModel.AddSystemMessage("Sending command results to assistant...")
-						app.ChatModel.ForceUpdateViewport()
-
-						// Send result back
-						cmds = append(cmds, app.sendFunctionResultCmd(sendFunctionResultMsg{
-							ctx:          context.Background(),
-							functionName: item.FunctionCall.Name,
-							callID:       item.FunctionCall.ID,
-							originalArgs: item.FunctionCall.Arguments,
-							output:       agentOutput,
-							success:      success,
-						}))
 					}
 				}
-				// Special case for read_file
-			} else if item.FunctionCall.Name == "read_file" {
-				var args map[string]interface{}
-				filePath := ""
-				if err := json.Unmarshal([]byte(item.FunctionCall.Arguments), &args); err != nil {
-					logDebug("[ERROR] Failed to unmarshal read_file args: %v", err)
-					// Handle parsing error
-					errMsg := fmt.Sprintf("Error parsing read_file args: %v", err)
-					app.ChatModel.AddSystemMessage(errMsg)
-					cmds = append(cmds, app.sendFunctionResultCmd(sendFunctionResultMsg{
-						ctx:          context.Background(),
-						functionName: item.FunctionCall.Name,
-						callID:       item.FunctionCall.ID,
-						originalArgs: item.FunctionCall.Arguments,
-						output:       errMsg,
-						success:      false,
-					}))
-				} else {
-					if path, ok := args["path"].(string); ok {
-						filePath = path
-						// Show a clear message about reading the file
-						app.ChatModel.AddSystemMessage(fmt.Sprintf("Reading file: %s", filePath))
-						app.ChatModel.ForceUpdateViewport()
-					}
-				}
-
-				// Fall through to general function execution below
+				// Special case for read_file OR OTHER functions
+			} else {
 				fn := app.FunctionRegistry.Get(item.FunctionCall.Name)
 				if fn == nil {
-					errMsg := fmt.Sprintf("Unknown function: %s", item.FunctionCall.Name)
-					logDebug("[ERROR] %s", errMsg)
-					app.ChatModel.AddSystemMessage(errMsg)
-					cmds = append(cmds, app.sendFunctionResultCmd(sendFunctionResultMsg{
-						ctx:          context.Background(),
-						functionName: item.FunctionCall.Name,
-						callID:       item.FunctionCall.ID,
-						originalArgs: item.FunctionCall.Arguments,
-						output:       errMsg,
-						success:      false,
-					}))
+					agentOutput = fmt.Sprintf("Unknown function: %s", item.FunctionCall.Name)
+					success = false
+					logDebug("[ERROR] %s", agentOutput)
+					app.ChatModel.AddSystemMessage(agentOutput)
 				} else {
 					// Execute the function from registry
 					result, err := fn(item.FunctionCall.Arguments)
 					logDebug("[DEBUG] Function '%s' execution result: ResultLen=%d, Error=%v", item.FunctionCall.Name, len(result), err)
-					success := err == nil
-					agentOutput := result
+					success = err == nil
+					agentOutput = result
 					if err != nil {
 						agentOutput = fmt.Sprintf("Error: %v", err)
 						app.ChatModel.AddSystemMessage(agentOutput) // Show error in UI too
-					} else {
-						// For read_file, show a preview in the UI
+					}
+
+					// Add specific UI updates based on function if needed (e.g., read_file preview)
+					if item.FunctionCall.Name == "read_file" && success {
 						previewLen := 200 // characters
 						preview := result
 						if len(preview) > previewLen {
@@ -488,114 +527,78 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) tea.Cmd {
 					}
 
 					// Display result using specific function result message
-					app.ChatModel.AddFunctionResultMessage(agentOutput, !success) // ANSI only if error? Adjust as needed
+					app.ChatModel.AddFunctionResultMessage(agentOutput, !success)
 					app.ChatModel.ForceUpdateViewport()
-
-					// After displaying function results, expect a new AI response
-					app.isFirstAgentChunk = true
-
-					// Show a message that we're sending results back to the assistant
-					app.ChatModel.AddSystemMessage("Sending file contents to assistant...")
-					app.ChatModel.ForceUpdateViewport()
-
-					// Send result back
-					cmds = append(cmds, app.sendFunctionResultCmd(sendFunctionResultMsg{
-						ctx:          context.Background(),
-						functionName: item.FunctionCall.Name,
-						callID:       item.FunctionCall.ID,
-						originalArgs: item.FunctionCall.Arguments,
-						output:       agentOutput,
-						success:      success,
-					}))
-				}
-				// --- Other Function Call Case ---
-			} else {
-				fn := app.FunctionRegistry.Get(item.FunctionCall.Name)
-				if fn == nil {
-					errMsg := fmt.Sprintf("Unknown function: %s", item.FunctionCall.Name)
-					logDebug("[ERROR] %s", errMsg)
-					app.ChatModel.AddSystemMessage(errMsg)
-					cmds = append(cmds, app.sendFunctionResultCmd(sendFunctionResultMsg{
-						ctx:          context.Background(),
-						functionName: item.FunctionCall.Name,
-						callID:       item.FunctionCall.ID,
-						originalArgs: item.FunctionCall.Arguments,
-						output:       errMsg,
-						success:      false,
-					}))
-				} else {
-					// Execute the function from registry
-					result, err := fn(item.FunctionCall.Arguments)
-					logDebug("[DEBUG] Function '%s' execution result: ResultLen=%d, Error=%v", item.FunctionCall.Name, len(result), err)
-					success := err == nil
-					agentOutput := result
-					if err != nil {
-						agentOutput = fmt.Sprintf("Error: %v", err)
-						app.ChatModel.AddSystemMessage(agentOutput) // Show error in UI too
-					}
-					// Display result using specific function result message
-					app.ChatModel.AddFunctionResultMessage(agentOutput, !success) // ANSI only if error? Adjust as needed
-
-					// After displaying function results, expect a new AI response
-					app.isFirstAgentChunk = true
-
-					// Show a message that we're sending results back to the assistant
-					app.ChatModel.AddSystemMessage("Sending function results to assistant...")
-					app.ChatModel.ForceUpdateViewport()
-
-					// Send result back
-					cmds = append(cmds, app.sendFunctionResultCmd(sendFunctionResultMsg{
-						ctx:          context.Background(),
-						functionName: item.FunctionCall.Name,
-						callID:       item.FunctionCall.ID,
-						originalArgs: item.FunctionCall.Arguments,
-						output:       agentOutput,
-						success:      success,
-					}))
 				}
 			}
+
+			// After displaying function results, expect a new AI response
+			app.isFirstAgentChunk = true
+
+			// Show a message that we're sending results back to the assistant
+			app.ChatModel.AddSystemMessage("Sending function results to assistant...")
+			app.ChatModel.ForceUpdateViewport()
+
+			// Prepare the message to send back results
+			resultMsg := sendFunctionResultMsg{
+				ctx:          context.Background(),
+				functionName: item.FunctionCall.Name,
+				callID:       item.FunctionCall.ID,
+				originalArgs: item.FunctionCall.Arguments,
+				output:       agentOutput,
+				success:      success,
+			}
+
+			// --- FIX: Send the result message asynchronously ---
+			logDebug("[DEBUG] App.handleAgentResponseItem: Starting goroutine to send sendFunctionResultMsg.")
+			go func() {
+				app.agentMsgChan <- resultMsg
+				logDebug("[DEBUG] App.handleAgentResponseItem: Goroutine finished sending sendFunctionResultMsg.")
+			}()
+			// Return immediately
 		}
 	}
 
-	// After processing the item, return command to wait for the next one
-	logDebug("[DEBUG] App.handleAgentResponseItem finished processing item type: %s. Waiting for next item.", item.Type)
-	cmds = append(cmds, waitForAgentActivityCmd(app.agentMsgChan))
-	return tea.Batch(cmds...)
+	// Return nil is implicit
+	logDebug("[WARN] App.handleAgentResponseItem received unhandled item type: %s.", item.Type)
 }
 
-// sendFunctionResultCmd returns a command that sends the function result back to the agent
-func (app *App) sendFunctionResultCmd(msg sendFunctionResultMsg) tea.Cmd {
-	return func() tea.Msg {
-		logDebug("[DEBUG] sendFunctionResultCmd: Preparing to send result for %s (callID: %s)", msg.functionName, msg.callID)
-		if app.Agent != nil {
-			// This runs synchronously within the command function
+// sendFunctionResultCmd processes the function result and sends it back to the agent
+// --- Returns nil because subsequent actions are triggered by messages on the channel ---
+func (app *App) sendFunctionResultCmd(msg sendFunctionResultMsg) /* tea.Cmd - REMOVED */ {
+	logDebug("[DEBUG] sendFunctionResultCmd: Preparing to send result for %s (callID: %s)", msg.functionName, msg.callID)
+	if app.Agent != nil {
+		// --- FIX: Run SendFunctionResult in a goroutine to avoid blocking Update loop ---
+		go func() {
 			err := app.Agent.SendFunctionResult(msg.ctx, msg.callID, msg.functionName, msg.output, msg.success)
-			logDebug("[DEBUG] sendFunctionResultCmd: Agent.SendFunctionResult returned error: %v", err)
+			logDebug("[DEBUG] sendFunctionResultCmd Goroutine: Agent.SendFunctionResult returned error: %v", err)
 			if err != nil {
-				// Return an error message to the main loop
-				logDebug("[ERROR] sendFunctionResultCmd: Returning agentErrorMsg due to SendFunctionResult failure.")
-				return agentErrorMsg{err: fmt.Errorf("failed to send function result for %s: %w", msg.functionName, err)}
+				// Put an error message on the channel
+				logDebug("[ERROR] sendFunctionResultCmd Goroutine: Sending agentErrorMsg due to SendFunctionResult failure.")
+				app.agentMsgChan <- agentErrorMsg{err: fmt.Errorf("failed to send function result for %s: %w", msg.functionName, err)}
+			} else {
+				// Success case - the follow-up stream handler will put messages (or followup_complete) on the channel
+				logDebug("[DEBUG] sendFunctionResultCmd Goroutine: Agent.SendFunctionResult success. Handler will send next messages.")
 			}
+		}()
 
-			// *CRITICAL FIX*: Always reset isFirstAgentChunk to true after function calls
-			// This ensures that the next message from the assistant will be treated as a new message
-			app.isFirstAgentChunk = true
-			logDebug("[DEBUG] sendFunctionResultCmd: Reset isFirstAgentChunk=true")
+		// *CRITICAL FIX*: Always reset isFirstAgentChunk to true AFTER INITIATING the send
+		app.isFirstAgentChunk = true
+		logDebug("[DEBUG] sendFunctionResultCmd: Reset isFirstAgentChunk=true")
 
-			// Show a visible system message about what's happening
-			app.ChatModel.AddSystemMessage("Function complete - waiting for assistant response...")
-			app.ChatModel.ForceUpdateViewport()
+		// Show a visible system message about what's happening
+		app.ChatModel.AddSystemMessage("Function complete - waiting for assistant response...")
+		app.ChatModel.ForceUpdateViewport()
 
-			// Display a temporary message to show the function was executed
-			app.ChatModel.SetThinkingStatus("Function executed, waiting for assistant response...")
+		// Display a temporary message to show the function was executed
+		app.ChatModel.SetThinkingStatus("Function executed, waiting for assistant response...")
 
-			// Return to wait for more responses
-			logDebug("[DEBUG] sendFunctionResultCmd: Finished. Returning nil cmd.")
-			return nil // Let the main loop continue; response comes via handler
-		} else {
-			logDebug("[ERROR] sendFunctionResultCmd: Agent is nil!")
-			return agentErrorMsg{err: fmt.Errorf("agent is nil, cannot send function result")}
-		}
+		// --- Don't return wait cmd ---
+		logDebug("[DEBUG] sendFunctionResultCmd: Finished initiating send.")
+	} else {
+		logDebug("[ERROR] sendFunctionResultCmd: Agent is nil!")
+		// Maybe send error message directly? This shouldn't happen.
+		app.agentMsgChan <- agentErrorMsg{err: fmt.Errorf("agent is nil, cannot send function result")}
 	}
 }
 
@@ -681,9 +684,11 @@ func (app *App) initRepositoryContext() error {
 	}
 
 	// Add the message to the agent's history
-	return app.Agent.SendMessage(ctx, []agent.Message{systemMsg}, func(item agent.ResponseItem) {
-		// No need to handle the response, just adding to history
+	_, err = app.Agent.SendMessage(ctx, []agent.Message{systemMsg}, func(itemJSON string) {
+		// No streamed response expected here, but handler signature must match.
+		// We could potentially log itemJSON if needed for debugging.
 	})
+	return err // Return the error from SendMessage
 }
 
 // loadRepositoryContext looks for and loads codex.md files

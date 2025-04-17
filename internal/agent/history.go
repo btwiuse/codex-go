@@ -173,6 +173,14 @@ func (h *ConversationHistory) GetMessages() []Message {
 	return h.Messages
 }
 
+// GetLastMessage returns the most recent message and a boolean indicating if found
+func (h *ConversationHistory) GetLastMessage() (Message, bool) {
+	if len(h.Messages) == 0 {
+		return Message{}, false
+	}
+	return h.Messages[len(h.Messages)-1], true
+}
+
 // Clear removes all messages from the history
 func (h *ConversationHistory) Clear() {
 	h.Messages = []Message{}

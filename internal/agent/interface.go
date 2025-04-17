@@ -38,15 +38,15 @@ type FunctionCallOutput struct {
 
 // ResponseItem represents a single response item from the AI
 type ResponseItem struct {
-	Type             string              // "message", "function_call", "function_call_output"
-	Message          *Message            // Present when Type is "message"
-	FunctionCall     *FunctionCall       // Present when Type is "function_call"
-	FunctionOutput   *FunctionCallOutput // Present when Type is "function_call_output"
-	ThinkingDuration int64               // How long the AI spent thinking (in ms)
+	Type             string              `json:"type"` // "message", "function_call", "followup_complete"
+	Message          *Message            `json:"message,omitempty"`
+	FunctionCall     *FunctionCall       `json:"functionCall,omitempty"`
+	FunctionOutput   *FunctionCallOutput `json:"functionOutput,omitempty"`
+	ThinkingDuration int64               `json:"thinkingDuration"`
 }
 
 // ResponseHandler is a callback for handling streaming response items
-type ResponseHandler func(item ResponseItem)
+type ResponseHandler func(itemJSON string)
 
 // CommandConfirmation represents user confirmation for a command
 type CommandConfirmation struct {
@@ -65,7 +65,8 @@ type FileChangeConfirmation struct {
 // Agent defines the interface for AI agents
 type Agent interface {
 	// SendMessage sends a message to the AI and streams the response
-	SendMessage(ctx context.Context, messages []Message, handler ResponseHandler) error
+	// Returns true if the stream finished requesting tool calls, false otherwise.
+	SendMessage(ctx context.Context, messages []Message, handler ResponseHandler) (bool, error)
 
 	// SendFileChange sends a file change to the AI for approval
 	SendFileChange(ctx context.Context, filePath string, diff string) (*FileChangeConfirmation, error)

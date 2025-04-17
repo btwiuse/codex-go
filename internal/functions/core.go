@@ -213,8 +213,11 @@ func ListDirectory(args string) (string, error) {
 	var params struct {
 		Path string `json:"path"`
 	}
-	if err := json.Unmarshal([]byte(args), &params); err != nil {
-		return "", fmt.Errorf("failed to parse arguments: %w", err)
+	// Only unmarshal if args is not empty
+	if args != "" {
+		if err := json.Unmarshal([]byte(args), &params); err != nil {
+			return "", fmt.Errorf("failed to parse arguments: %w", err)
+		}
 	}
 
 	// Use current directory if path is not specified
