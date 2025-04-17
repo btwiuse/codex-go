@@ -43,6 +43,10 @@ type Config struct {
 
 	// Approval configuration
 	ApprovalMode ApprovalMode `mapstructure:"approval_mode"`
+
+	// Logging configuration
+	Debug   bool   `mapstructure:"debug"`    // Enable debug logging
+	LogFile string `mapstructure:"log_file"` // Path to log file
 }
 
 const (

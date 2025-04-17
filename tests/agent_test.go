@@ -2,12 +2,14 @@ package tests
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/epuerta/codex-go/internal/agent"
 	"github.com/epuerta/codex-go/internal/config"
+	"github.com/epuerta/codex-go/internal/logging"
 )
 
 func TestOpenAIAgent(t *testing.T) {
@@ -25,8 +27,11 @@ func TestOpenAIAgent(t *testing.T) {
 		ApprovalMode: config.Suggest,
 	}
 
+	// Create a nil logger for testing
+	logger := logging.NewNilLogger()
+
 	// Create an OpenAI agent
-	openaiAgent, err := agent.NewOpenAIAgent(cfg)
+	openaiAgent, err := agent.NewOpenAIAgent(cfg, logger)
 	if err != nil {
 		t.Fatalf("Failed to create OpenAI agent: %v", err)
 	}
@@ -51,15 +56,19 @@ func TestOpenAIAgent(t *testing.T) {
 	respChan := make(chan agent.ResponseItem)
 	var responses []agent.ResponseItem
 
-	// Set up a handler function that sends items to the channel
-	handler := func(item agent.ResponseItem) {
-		respChan <- item
-	}
-
 	// Send the message in a goroutine
 	go func() {
 		defer close(respChan)
-		err := openaiAgent.SendMessage(ctx, messages, handler)
+		// Convert our handler to accept string JSON
+		jsonHandler := func(jsonStr string) {
+			var item agent.ResponseItem
+			if err := json.Unmarshal([]byte(jsonStr), &item); err != nil {
+				t.Errorf("Error unmarshalling response item: %v", err)
+				return
+			}
+			respChan <- item
+		}
+		_, err := openaiAgent.SendMessage(ctx, messages, jsonHandler)
 		if err != nil {
 			t.Errorf("Error sending message: %v", err)
 		}

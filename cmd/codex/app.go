@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/epuerta/codex-go/internal/agent"
 	"github.com/epuerta/codex-go/internal/config"
 	"github.com/epuerta/codex-go/internal/functions"
+	"github.com/epuerta/codex-go/internal/logging"
 	"github.com/epuerta/codex-go/internal/sandbox"
 	"github.com/epuerta/codex-go/internal/ui"
 	"github.com/google/uuid"
@@ -61,6 +63,7 @@ type App struct {
 	FunctionRegistry *functions.Registry
 	IsRunning        bool
 	Sandbox          sandbox.Sandbox
+	Logger           logging.Logger
 
 	// Rollout tracking
 	CurrentRollout *AppRollout
@@ -87,15 +90,20 @@ type AppRollout struct {
 }
 
 // NewApp creates a new application instance
-func NewApp(config *config.Config) (*App, error) {
+func NewApp(config *config.Config, logger logging.Logger) (*App, error) {
+	logger.Log("Initializing App...")
 	// Initialize the agent
-	a, err := agent.NewOpenAIAgent(config)
+	a, err := agent.NewOpenAIAgent(config, logger)
 	if err != nil {
+		logger.Log("Failed to initialize agent: %v", err)
 		return nil, fmt.Errorf("failed to initialize agent: %w", err)
 	}
 
 	// Create chat model (no callback needed here)
 	chatModel := ui.NewChatModel()
+
+	// Set the logger
+	chatModel.SetLogger(logger)
 
 	// Set the agent reference in the chat model for history access
 	chatModel.SetAgent(a)
@@ -129,22 +137,26 @@ func NewApp(config *config.Config) (*App, error) {
 		FunctionRegistry: registry,
 		IsRunning:        false,
 		Sandbox:          sb,
+		Logger:           logger,
 		agentMsgChan:     make(chan tea.Msg), // Initialize channel
 	}
 
+	logger.Log("Repository context check: DisableProjectDoc=%t", config.DisableProjectDoc)
 	// Initialize repository context if not disabled
 	if !config.DisableProjectDoc {
 		if err := app.initRepositoryContext(); err != nil {
 			// Log the error but continue
-			// fmt.Fprintf(os.Stderr, "Warning: Failed to initialize repository context: %v\n", err) // Commented out again
+			logger.Log("Warning: Failed to initialize repository context: %v", err)
 		}
 	}
 
+	logger.Log("App initialized successfully.")
 	return app, nil
 }
 
 // Init initializes the application model
 func (app *App) Init() tea.Cmd {
+	app.Logger.Log("App.Init called")
 	// Start the dedicated channel listener command
 	return tea.Batch(app.ChatModel.Init(), app.listenForAgentMessages())
 }
@@ -154,51 +166,45 @@ func (app *App) Init() tea.Cmd {
 func (app *App) listenForAgentMessages() tea.Cmd {
 	return func() tea.Msg {
 		msg := <-app.agentMsgChan // Block and wait for the next message
-		logDebug("[DEBUG] listenForAgentMessages: Received %T from channel, returning to Update.", msg)
-		// --- Revert: Return the message directly ---
+		app.Logger.Log("listenForAgentMessages: Received %T from channel, returning to Update.", msg)
 		return msg
 	}
 }
 
 // Update handles messages for the application model
 func (app *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd // Keep cmd for potential non-agent commands from ChatModel.Update
+	var cmd tea.Cmd
 	var agentMessageHandled bool = false
-	var skipChatModelUpdate bool = false // Use flag
+	var skipChatModelUpdate bool = false
 
-	// Remove debug logging
-	// fmt.Fprintf(os.Stderr, "App.Update received msg type: %T\n", msg)
+	app.Logger.Log("App.Update received msg type: %T", msg)
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		app.Logger.Log("Received WindowSizeMsg: Width=%d, Height=%d", msg.Width, msg.Height)
 		app.width = msg.Width
 		app.height = msg.Height
-		// Allow ChatModel to handle the rest below
 
 	case tea.KeyMsg:
-		// Only handle Quit keys here
-		// fmt.Fprintf(os.Stderr, "App.Update: KeyMsg received: %v, Type: %v, String: %q\n", msg, msg.Type, msg.String())
+		app.Logger.Log("Received KeyMsg: Type=%v, Rune=%q, Alt=%t", msg.Type, msg.Runes, msg.Alt)
 		if msg.Type == tea.KeyCtrlC || msg.Type == tea.KeyEsc || (msg.String() == "q" && app.ChatModel.InputIsEmpty()) {
+			app.Logger.Log("Quit key detected. Shutting down.")
 			app.IsRunning = false
-			return app, tea.Quit // Quit directly
+			return app, tea.Quit
 		}
-		// Other keys fall through to ChatModel.Update below
 
-	// --- NEW: Handle submit message from ChatModel ---
 	case ui.UserInputSubmitMsg:
-		// --- BEGIN /clear and /help handling ---
 		if strings.HasPrefix(msg.Content, "/") {
 			command := strings.TrimSpace(msg.Content)
 			if command == "/clear" {
-				logDebug("[DEBUG] User command: /clear")
-				app.Agent.ClearHistory()                                // Clear agent's internal history
-				app.ChatModel.ClearMessages()                           // Clear UI messages
-				app.ChatModel.AddSystemMessage("Chat history cleared.") // Notify user
+				app.Logger.Log("User command: /clear")
+				app.Agent.ClearHistory()
+				app.ChatModel.ClearMessages()
+				app.ChatModel.AddSystemMessage("Chat history cleared.")
 				skipChatModelUpdate = true
-				cmd = nil // No further command needed immediately
-				// Ensure we don't proceed to agent processing
+				cmd = nil
 			} else if command == "/help" {
-				logDebug("[DEBUG] User command: /help")
+				app.Logger.Log("User command: /help")
 				helpText := `Codex-Go Help:
   /clear : Clears the current conversation history.
   /help  : Shows this help message.
@@ -206,66 +212,66 @@ func (app *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
   Enter  : Sends your message to the assistant.`
 				app.ChatModel.AddSystemMessage(helpText)
 				skipChatModelUpdate = true
-				cmd = nil // No further command needed immediately
-				// Ensure we don't proceed to agent processing
+				cmd = nil
 			} else {
-				// Unknown command, maybe notify user or just ignore?
+				app.Logger.Log("User command: Unknown command: %s", command)
 				app.ChatModel.AddSystemMessage(fmt.Sprintf("Unknown command: %s", command))
 				skipChatModelUpdate = true
 				cmd = nil
 			}
 		} else {
-			// --- Not a command, proceed with normal message handling ---
-			// --- FIX: Check if agent is already processing ---
 			if app.isAgentProcessing {
-				logDebug("[WARN] User submitted input while agent is processing. Ignoring.")
+				app.Logger.Log("WARN: User submitted input while agent is processing. Ignoring.")
 				skipChatModelUpdate = true
 				cmd = nil
 			} else {
-				logDebug("[DEBUG] User submitted input. Starting agent stream.")
+				app.Logger.Log("User submitted input. Starting agent stream: %q", msg.Content)
 				app.ChatModel.AddUserMessage(msg.Content)
 				app.ChatModel.StartThinking()
 				app.isFirstAgentChunk = true
-				app.isAgentProcessing = true // <-- Set agent busy flag
+				app.isAgentProcessing = true
 				cmd = app.listenAgentStreamCmd(msg.Content)
 				skipChatModelUpdate = true
 			}
 		}
-		// --- END /clear and /help handling ---
 
-	// --- Agent Message Cases (Handled by App) ---
 	case agentResponseMsg:
+		app.Logger.Log("Received agentResponseMsg")
 		app.handleAgentResponseItem(msg.item)
 		cmd = app.listenForAgentMessages()
 		agentMessageHandled = true
 		skipChatModelUpdate = true
 
 	case agentErrorMsg:
+		app.Logger.Log("ERROR: Received agentErrorMsg: %v", msg.err)
 		app.ChatModel.AddSystemMessage(fmt.Sprintf("Error: %v", msg.err))
 		app.ChatModel.StopThinking()
 		app.isFirstAgentChunk = false
-		app.isAgentProcessing = false // <-- Clear agent busy flag
+		app.isAgentProcessing = false
 		cmd = app.listenForAgentMessages()
 		agentMessageHandled = true
 		skipChatModelUpdate = true
 
-	case agentStreamCompleteMsg: // Completion of initial stream WITHOUT tool calls
+	case agentStreamCompleteMsg:
+		app.Logger.Log("Received agentStreamCompleteMsg (no tool calls)")
 		app.ChatModel.StopThinking()
 		app.isFirstAgentChunk = false
-		app.isAgentProcessing = false // <-- Clear agent busy flag
+		app.isAgentProcessing = false
 		cmd = app.listenForAgentMessages()
 		agentMessageHandled = true
 		skipChatModelUpdate = true
 
-	case agentFollowUpCompleteMsg: // Completion of a follow-up stream
+	case agentFollowUpCompleteMsg:
+		app.Logger.Log("Received agentFollowUpCompleteMsg")
 		app.ChatModel.StopThinking()
 		app.isFirstAgentChunk = false
-		app.isAgentProcessing = false // <-- Clear agent busy flag
+		app.isAgentProcessing = false
 		cmd = app.listenForAgentMessages()
 		agentMessageHandled = true
 		skipChatModelUpdate = true
 
 	case sendFunctionResultMsg:
+		app.Logger.Log("Received sendFunctionResultMsg for %s", msg.functionName)
 		app.sendFunctionResultCmd(msg)
 		cmd = app.listenForAgentMessages()
 		agentMessageHandled = true
@@ -273,74 +279,61 @@ func (app *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	}
 
-	// Pass message down to ChatModel ONLY if it wasn't handled above
 	if !skipChatModelUpdate {
+		app.Logger.Log("Passing message %T to ChatModel.Update", msg)
 		var updatedChatModel tea.Model
-		updatedChatModel, cmd = app.ChatModel.Update(msg) // Assign cmd here
+		updatedChatModel, cmd = app.ChatModel.Update(msg)
 		if updatedChatModelTyped, ok := updatedChatModel.(ui.ChatModel); ok {
 			app.ChatModel = updatedChatModelTyped
 		}
-		// Don't append cmd here if it was already set by a handled message
 	} else if cmd == nil {
-		// If handled BUT no specific cmd was returned (e.g. StopThinking messages)
-		// ensure cmd is nil so we don't Batch an empty command later.
-		// Note: This might need refinement depending on how tea.Batch handles nil cmds
+		app.Logger.Log("Skipped ChatModel.Update for %T, cmd is nil", msg)
 	}
 
-	// Force viewport update if an agent message modified the state
 	if agentMessageHandled {
+		app.Logger.Log("Agent message handled, forcing viewport update.")
 		app.ChatModel.ForceUpdateViewport()
 	}
 
-	// Return the single command OR batch if necessary (though batching is less likely now)
-	// If cmd is nil from handled messages, tea.Batch(nil) might be okay or need explicit nil return?
-	// Let's return cmd directly for now, assuming non-batch cases are dominant. Check Bubble Tea docs if batching nil is problematic.
 	if cmd != nil {
+		app.Logger.Log("App.Update returning command: %T", cmd)
 		return app, cmd
 	}
 
-	// fmt.Fprintf(os.Stderr, "App.Update finished for msg type: %T\n", msg)
-	return app, nil // Return nil command if nothing else to do
+	app.Logger.Log("App.Update finished for %T, returning nil command", msg)
+	return app, nil
 }
 
 // View renders the application UI
 func (app *App) View() string {
-	// Delegate rendering to the ChatModel
+	// Logging in View can be very noisy, avoid unless necessary
+	// app.Logger.Log("App.View called")
 	return app.ChatModel.View()
 }
 
-// Placeholder for the debug logger function definition - it should be here somewhere
-// func logDebug(format string, args ...interface{}) { ... }
-// Let's assume it's defined elsewhere or remove its calls for now
-
 // listenAgentStreamCmd starts the agent stream goroutine which sends messages to app.agentMsgChan
 func (app *App) listenAgentStreamCmd(content string) tea.Cmd {
-	logDebug("[DEBUG] listenAgentStreamCmd: Starting agent stream goroutine for content: '%s'", content)
+	app.Logger.Log("listenAgentStreamCmd: Starting agent stream goroutine for content: %q", content)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute) // Use a timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 
 		message := agent.Message{Role: "user", Content: content}
 
-		logDebug("[DEBUG] listenAgentStreamCmd: Goroutine started. Calling Agent.SendMessage...")
+		app.Logger.Log("listenAgentStreamCmd: Goroutine started. Calling Agent.SendMessage...")
 		streamEndedWithTools, err := app.Agent.SendMessage(ctx, []agent.Message{message}, func(itemJSON string) {
-			// ADD LOG: Log the raw JSON received
-			logDebug("[DEBUG] listenAgentStreamCmd Handler: Received JSON string: '%s'", itemJSON) // Log raw JSON
+			app.Logger.Log("listenAgentStreamCmd Handler: Received JSON string: %q", itemJSON)
 
-			// Unmarshal the JSON string back into a ResponseItem
 			var item agent.ResponseItem
 			err := json.Unmarshal([]byte(itemJSON), &item)
 			if err != nil {
-				logDebug("[ERROR] listenAgentStreamCmd Handler: Failed to unmarshal ResponseItem JSON: %v", err)
-				// Send an error message back?
+				app.Logger.Log("ERROR: listenAgentStreamCmd Handler: Failed to unmarshal ResponseItem JSON: %v. JSON: %s", err, itemJSON)
 				app.agentMsgChan <- agentErrorMsg{err: fmt.Errorf("failed to unmarshal agent response: %w", err)}
 				return
 			}
 
-			// --- FIX: Send specific message based on item.Type ---
 			switch item.Type {
 			case "message", "function_call":
-				// Deep copy FunctionCall if present
 				fcCopy := item.FunctionCall
 				if item.FunctionCall != nil {
 					copiedFC := *item.FunctionCall
@@ -352,93 +345,70 @@ func (app *App) listenAgentStreamCmd(content string) tea.Cmd {
 					FunctionCall:     fcCopy,
 					ThinkingDuration: item.ThinkingDuration,
 				}
-				logDebug("[DEBUG] listenAgentStreamCmd Handler: Sending agentResponseMsg to channel (Type: %s).", item.Type)
+				app.Logger.Log("listenAgentStreamCmd Handler: Sending agentResponseMsg to channel (Type: %s).", item.Type)
 				app.agentMsgChan <- agentResponseMsg{item: itemToSend}
 			case "followup_complete":
-				logDebug("[DEBUG] listenAgentStreamCmd Handler: Sending agentFollowUpCompleteMsg to channel.")
+				app.Logger.Log("listenAgentStreamCmd Handler: Sending agentFollowUpCompleteMsg to channel.")
 				app.agentMsgChan <- agentFollowUpCompleteMsg{}
 			default:
-				logDebug("[WARN] listenAgentStreamCmd Handler: Received unknown item type '%s'. Ignoring.", item.Type)
+				app.Logger.Log("WARN: listenAgentStreamCmd Handler: Received unknown item type '%s'. Ignoring.", item.Type)
 			}
 		})
-		logDebug("[DEBUG] listenAgentStreamCmd: Goroutine finished Agent.SendMessage call. Error: %v, EndedWithTools: %t", err, streamEndedWithTools)
+		app.Logger.Log("listenAgentStreamCmd: Goroutine finished Agent.SendMessage call. Error: %v, EndedWithTools: %t", err, streamEndedWithTools)
 
-		// After the stream is done, send completion or error message
 		if err != nil {
-			logDebug("[DEBUG] listenAgentStreamCmd: Goroutine sending agentErrorMsg to channel.")
+			app.Logger.Log("listenAgentStreamCmd: Goroutine sending agentErrorMsg to channel.")
 			app.agentMsgChan <- agentErrorMsg{err: err}
 		} else if !streamEndedWithTools {
-			// --- FIX: Send complete ONLY if no error AND didn't end with tools ---
-			logDebug("[DEBUG] listenAgentStreamCmd: Goroutine finished normally and without tool calls. Sending agentStreamCompleteMsg.")
+			app.Logger.Log("listenAgentStreamCmd: Goroutine finished normally and without tool calls. Sending agentStreamCompleteMsg.")
 			app.agentMsgChan <- agentStreamCompleteMsg{}
 		} else {
-			// Stream ended normally requesting tools, do nothing, wait for follow-up.
-			logDebug("[DEBUG] listenAgentStreamCmd: Goroutine finished normally, ended with tool calls. NOT sending agentStreamCompleteMsg.")
+			app.Logger.Log("listenAgentStreamCmd: Goroutine finished normally, ended with tool calls. NOT sending agentStreamCompleteMsg.")
 		}
 	}()
 
-	// --- Return nil --- The listener started in Init handles receiving messages
-	logDebug("[DEBUG] listenAgentStreamCmd: Returning nil command.")
+	app.Logger.Log("listenAgentStreamCmd: Returning nil command.")
 	return nil
 }
 
 // handleAgentResponseItem processes a single response item from the agent
-// --- Returns nil because subsequent actions are triggered by messages on the channel ---
-func (app *App) handleAgentResponseItem(item agent.ResponseItem) /* tea.Cmd - REMOVED */ {
-	logDebug("[DEBUG] App.handleAgentResponseItem received item type: %s", item.Type)
+func (app *App) handleAgentResponseItem(item agent.ResponseItem) {
+	app.Logger.Log("App.handleAgentResponseItem received item type: %s", item.Type)
 
 	switch item.Type {
 	case "message":
-		logDebug("[DEBUG] Handling 'message' item.")
+		app.Logger.Log("Handling 'message' item.")
 		if item.Message != nil {
-			logDebug("[DEBUG] Message item content: %q", item.Message.Content)
-			logDebug("[DEBUG] isFirstAgentChunk state *before* processing message: %t", app.isFirstAgentChunk)
+			app.Logger.Log("Message item content length: %d", len(item.Message.Content))
+			app.Logger.Log("isFirstAgentChunk state *before* processing message: %t", app.isFirstAgentChunk)
 			app.ChatModel.SetThinkingStatus(fmt.Sprintf("Receiving message chunk..."))
 			content := item.Message.Content
-			logDebug("[DEBUG] Message content length: %d", len(content))
-
-			// Add a debug system message to track message flow
-			// app.ChatModel.AddSystemMessage(fmt.Sprintf("Agent is responding (%d chars)", len(content)))
 
 			if app.isFirstAgentChunk {
-				logDebug("[DEBUG] isFirstAgentChunk=true, adding new assistant message.")
+				app.Logger.Log("isFirstAgentChunk=true, adding new assistant message.")
 				app.ChatModel.AddAssistantMessage(content)
 				app.isFirstAgentChunk = false
-				// app.ChatModel.AddSystemMessage("Added new assistant message")
-				logDebug("[DEBUG] Called AddAssistantMessage, set isFirstAgentChunk=false")
+				app.Logger.Log("Called AddAssistantMessage, set isFirstAgentChunk=false")
 			} else {
-				logDebug("[DEBUG] isFirstAgentChunk=false, updating last assistant message.")
+				app.Logger.Log("isFirstAgentChunk=false, updating last assistant message.")
 				app.ChatModel.UpdateLastAssistantMessage(content)
-				// app.ChatModel.AddSystemMessage("Updated existing assistant message")
-				logDebug("[DEBUG] Called UpdateLastAssistantMessage")
+				app.Logger.Log("Called UpdateLastAssistantMessage")
 			}
 
-			// Force UI update to show the new message
 			app.ChatModel.ForceUpdateViewport()
-			logDebug("[DEBUG] Called ForceUpdateViewport in message handler.")
+			app.Logger.Log("Called ForceUpdateViewport in message handler.")
 		} else {
-			logDebug("[WARN] Handling 'message' item, but item.Message is nil.")
+			app.Logger.Log("WARN: Handling 'message' item, but item.Message is nil.")
 		}
-		// After processing message, wait for the next item from the *same* stream
-		logDebug("[DEBUG] App.handleAgentResponseItem finished processing message.")
+		app.Logger.Log("App.handleAgentResponseItem finished processing message.")
 
 	case "function_call":
 		if item.FunctionCall != nil {
-			logDebug("[DEBUG] handleAgentResponseItem received function_call. Args: '%s'", item.FunctionCall.Arguments)
-		} else {
-			logDebug("[DEBUG] handleAgentResponseItem received function_call, but item.FunctionCall is nil.")
-		}
-
-		logDebug("[DEBUG] Handling 'function_call' item.")
-		if item.FunctionCall != nil {
+			app.Logger.Log("Handling 'function_call' item. Name: %s, ID: %s, Args: %q", item.FunctionCall.Name, item.FunctionCall.ID, item.FunctionCall.Arguments)
 			app.ChatModel.SetThinkingStatus(fmt.Sprintf("Calling %s...", item.FunctionCall.Name))
-			logDebug("[DEBUG] Function Call Name: %s, Args: %s, ID: %s", item.FunctionCall.Name, item.FunctionCall.Arguments, item.FunctionCall.ID)
-
-			// Add UI element showing the function call is happening
 			app.ChatModel.AddFunctionCallMessage(item.FunctionCall.Name, item.FunctionCall.Arguments)
 			app.ChatModel.ForceUpdateViewport()
 
-			// Add a user-visible message about what's happening
 			statusMsg := fmt.Sprintf("Executing function: %s", item.FunctionCall.Name)
 			app.ChatModel.AddSystemMessage(statusMsg)
 			app.ChatModel.ForceUpdateViewport()
@@ -446,12 +416,11 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) /* tea.Cmd - RE
 			var agentOutput string
 			var success bool
 
-			// --- Execute Command Case ---
 			if item.FunctionCall.Name == "execute_command" {
 				var args map[string]interface{}
 				cmdStr := ""
 				if err := json.Unmarshal([]byte(item.FunctionCall.Arguments), &args); err != nil {
-					logDebug("[ERROR] Failed to unmarshal execute_command args: %v", err)
+					app.Logger.Log("ERROR: Failed to unmarshal execute_command args: %v. Args: %s", err, item.FunctionCall.Arguments)
 					agentOutput = fmt.Sprintf("Error parsing command args: %v", err)
 					success = false
 					app.ChatModel.AddSystemMessage(agentOutput)
@@ -459,33 +428,31 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) /* tea.Cmd - RE
 					var ok bool
 					cmdStr, ok = args["command"].(string)
 					if !ok || cmdStr == "" {
-						logDebug("[ERROR] Missing or invalid 'command' argument in execute_command.")
+						app.Logger.Log("ERROR: Missing or invalid 'command' argument in execute_command. Args: %+v", args)
 						agentOutput = "Missing command argument for execute_command"
 						success = false
 						app.ChatModel.AddSystemMessage(agentOutput)
 					} else {
-						// Execute the command via Sandbox
+						app.Logger.Log("Executing command via sandbox: %s", cmdStr)
 						app.ChatModel.SetThinkingStatus(fmt.Sprintf("Executing: %s", cmdStr))
 						result, err := app.Sandbox.Execute(context.Background(), sandbox.SandboxOptions{
 							Command:    cmdStr,
-							WorkingDir: app.Config.CWD, // Use configured CWD
+							WorkingDir: app.Config.CWD,
 							Timeout:    30 * time.Second,
 						})
-						logDebug("[DEBUG] Sandbox execution result: ExitCode=%d, StdoutLen=%d, StderrLen=%d, Error=%v", result.ExitCode, len(result.Stdout), len(result.Stderr), err)
+						app.Logger.Log("Sandbox execution result: ExitCode=%d, StdoutLen=%d, StderrLen=%d, Error=%v", result.ExitCode, len(result.Stdout), len(result.Stderr), err)
 
-						// Create CommandResult for UI
 						uiResult := &ui.CommandResult{
 							Command:  cmdStr,
 							Stdout:   result.Stdout,
 							Stderr:   result.Stderr,
 							ExitCode: result.ExitCode,
-							Duration: result.Duration, // Sandbox provides duration
-							Error:    err,             // Include sandbox execution error
+							Duration: result.Duration,
+							Error:    err,
 						}
 						app.ChatModel.AddCommandMessage(cmdStr, uiResult)
 						app.ChatModel.ForceUpdateViewport()
 
-						// Determine result/output for agent
 						agentOutput = result.Stdout
 						success = err == nil && result.ExitCode == 0
 						if !success {
@@ -497,28 +464,26 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) /* tea.Cmd - RE
 						}
 					}
 				}
-				// Special case for read_file OR OTHER functions
 			} else {
 				fn := app.FunctionRegistry.Get(item.FunctionCall.Name)
 				if fn == nil {
 					agentOutput = fmt.Sprintf("Unknown function: %s", item.FunctionCall.Name)
 					success = false
-					logDebug("[ERROR] %s", agentOutput)
+					app.Logger.Log("ERROR: %s", agentOutput)
 					app.ChatModel.AddSystemMessage(agentOutput)
 				} else {
-					// Execute the function from registry
+					app.Logger.Log("Executing registered function: %s", item.FunctionCall.Name)
 					result, err := fn(item.FunctionCall.Arguments)
-					logDebug("[DEBUG] Function '%s' execution result: ResultLen=%d, Error=%v", item.FunctionCall.Name, len(result), err)
+					app.Logger.Log("Function '%s' execution result: ResultLen=%d, Error=%v", item.FunctionCall.Name, len(result), err)
 					success = err == nil
 					agentOutput = result
 					if err != nil {
 						agentOutput = fmt.Sprintf("Error: %v", err)
-						app.ChatModel.AddSystemMessage(agentOutput) // Show error in UI too
+						app.ChatModel.AddSystemMessage(agentOutput)
 					}
 
-					// Add specific UI updates based on function if needed (e.g., read_file preview)
 					if item.FunctionCall.Name == "read_file" && success {
-						previewLen := 200 // characters
+						previewLen := 200
 						preview := result
 						if len(preview) > previewLen {
 							preview = preview[:previewLen] + "..."
@@ -526,20 +491,16 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) /* tea.Cmd - RE
 						app.ChatModel.AddSystemMessage(fmt.Sprintf("Read file content (preview): %s", preview))
 					}
 
-					// Display result using specific function result message
 					app.ChatModel.AddFunctionResultMessage(agentOutput, !success)
 					app.ChatModel.ForceUpdateViewport()
 				}
 			}
 
-			// After displaying function results, expect a new AI response
 			app.isFirstAgentChunk = true
 
-			// Show a message that we're sending results back to the assistant
 			app.ChatModel.AddSystemMessage("Sending function results to assistant...")
 			app.ChatModel.ForceUpdateViewport()
 
-			// Prepare the message to send back results
 			resultMsg := sendFunctionResultMsg{
 				ctx:          context.Background(),
 				functionName: item.FunctionCall.Name,
@@ -549,80 +510,80 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) /* tea.Cmd - RE
 				success:      success,
 			}
 
-			// --- FIX: Send the result message asynchronously ---
-			logDebug("[DEBUG] App.handleAgentResponseItem: Starting goroutine to send sendFunctionResultMsg.")
+			app.Logger.Log("App.handleAgentResponseItem: Starting goroutine to send sendFunctionResultMsg for %s (callID: %s).", resultMsg.functionName, resultMsg.callID)
 			go func() {
 				app.agentMsgChan <- resultMsg
-				logDebug("[DEBUG] App.handleAgentResponseItem: Goroutine finished sending sendFunctionResultMsg.")
+				app.Logger.Log("App.handleAgentResponseItem: Goroutine finished sending sendFunctionResultMsg.")
 			}()
-			// Return immediately
+		} else {
+			app.Logger.Log("WARN: Handling 'function_call' item, but item.FunctionCall is nil.")
 		}
-	}
 
-	// Return nil is implicit
-	logDebug("[WARN] App.handleAgentResponseItem received unhandled item type: %s.", item.Type)
+	default:
+		app.Logger.Log("WARN: App.handleAgentResponseItem received unhandled item type: %s.", item.Type)
+	}
 }
 
 // sendFunctionResultCmd processes the function result and sends it back to the agent
-// --- Returns nil because subsequent actions are triggered by messages on the channel ---
-func (app *App) sendFunctionResultCmd(msg sendFunctionResultMsg) /* tea.Cmd - REMOVED */ {
-	logDebug("[DEBUG] sendFunctionResultCmd: Preparing to send result for %s (callID: %s)", msg.functionName, msg.callID)
+func (app *App) sendFunctionResultCmd(msg sendFunctionResultMsg) {
+	app.Logger.Log("sendFunctionResultCmd: Preparing to send result for %s (callID: %s), success=%t", msg.functionName, msg.callID, msg.success)
 	if app.Agent != nil {
-		// --- FIX: Run SendFunctionResult in a goroutine to avoid blocking Update loop ---
 		go func() {
+			app.Logger.Log("sendFunctionResultCmd Goroutine: Calling Agent.SendFunctionResult for %s...", msg.functionName)
 			err := app.Agent.SendFunctionResult(msg.ctx, msg.callID, msg.functionName, msg.output, msg.success)
-			logDebug("[DEBUG] sendFunctionResultCmd Goroutine: Agent.SendFunctionResult returned error: %v", err)
+			app.Logger.Log("sendFunctionResultCmd Goroutine: Agent.SendFunctionResult returned error: %v", err)
 			if err != nil {
-				// Put an error message on the channel
-				logDebug("[ERROR] sendFunctionResultCmd Goroutine: Sending agentErrorMsg due to SendFunctionResult failure.")
+				app.Logger.Log("ERROR: sendFunctionResultCmd Goroutine: Sending agentErrorMsg due to SendFunctionResult failure: %v", err)
 				app.agentMsgChan <- agentErrorMsg{err: fmt.Errorf("failed to send function result for %s: %w", msg.functionName, err)}
 			} else {
-				// Success case - the follow-up stream handler will put messages (or followup_complete) on the channel
-				logDebug("[DEBUG] sendFunctionResultCmd Goroutine: Agent.SendFunctionResult success. Handler will send next messages.")
+				app.Logger.Log("sendFunctionResultCmd Goroutine: Agent.SendFunctionResult success. Handler will send next messages.")
 			}
 		}()
 
-		// *CRITICAL FIX*: Always reset isFirstAgentChunk to true AFTER INITIATING the send
 		app.isFirstAgentChunk = true
-		logDebug("[DEBUG] sendFunctionResultCmd: Reset isFirstAgentChunk=true")
+		app.Logger.Log("sendFunctionResultCmd: Reset isFirstAgentChunk=true")
 
-		// Show a visible system message about what's happening
 		app.ChatModel.AddSystemMessage("Function complete - waiting for assistant response...")
 		app.ChatModel.ForceUpdateViewport()
 
-		// Display a temporary message to show the function was executed
 		app.ChatModel.SetThinkingStatus("Function executed, waiting for assistant response...")
 
-		// --- Don't return wait cmd ---
-		logDebug("[DEBUG] sendFunctionResultCmd: Finished initiating send.")
+		app.Logger.Log("sendFunctionResultCmd: Finished initiating send.")
 	} else {
-		logDebug("[ERROR] sendFunctionResultCmd: Agent is nil!")
-		// Maybe send error message directly? This shouldn't happen.
+		app.Logger.Log("ERROR: sendFunctionResultCmd: Agent is nil!")
 		app.agentMsgChan <- agentErrorMsg{err: fmt.Errorf("agent is nil, cannot send function result")}
 	}
 }
 
 // needsApprovalForFunction determines if a function needs approval based on the current mode
 func (app *App) needsApprovalForFunction(functionName string) bool {
+	// Logging the check
+	app.Logger.Log("Checking approval for function '%s' with mode '%s'", functionName, app.Config.ApprovalMode)
+
 	switch app.Config.ApprovalMode {
 	case config.Suggest:
-		// In suggest mode, all operations except reading need approval
-		return functionName != "read_file" && functionName != "list_directory"
+		needs := functionName != "read_file" && functionName != "list_directory"
+		app.Logger.Log("Suggest Mode: Needs approval = %t", needs)
+		return needs
 	case config.AutoEdit:
-		// In auto-edit mode, only commands need approval
-		return functionName == "execute_command"
+		needs := functionName == "execute_command"
+		app.Logger.Log("AutoEdit Mode: Needs approval = %t", needs)
+		return needs
 	case config.FullAuto:
-		// In full-auto mode, nothing needs approval
+		app.Logger.Log("FullAuto Mode: Needs approval = false")
+		return false
+	case config.DangerousAutoApprove:
+		app.Logger.Log("Dangerous Mode: Needs approval = false")
 		return false
 	default:
-		// Default to most restrictive (suggest)
+		app.Logger.Log("WARN: Unknown approval mode '%s', defaulting to 'suggest' behavior.", app.Config.ApprovalMode)
 		return functionName != "read_file" && functionName != "list_directory"
 	}
 }
 
 // askForApproval prompts the user for approval of a function call
 func (app *App) askForApproval(functionName, args string) (bool, string) {
-	// Determine what kind of operation is being performed
+	app.Logger.Log("Asking for approval: Function=%s, Args=%q", functionName, args)
 	var operationType, title, description string
 	switch functionName {
 	case "write_file":
@@ -643,12 +604,12 @@ func (app *App) askForApproval(functionName, args string) (bool, string) {
 		description = "The assistant wants to perform an operation"
 	}
 
-	// Add a system message to show the approval request
 	app.ChatModel.AddSystemMessage(fmt.Sprintf("Waiting for approval to %s: %s", operationType, args))
+	app.ChatModel.ForceUpdateViewport() // Update UI to show prompt
 
-	// Use the approval UI to get user confirmation
 	approved, err := ui.GetApproval(title, description, args)
 	if err != nil {
+		app.Logger.Log("Error during approval UI: %v", err)
 		app.ChatModel.AddSystemMessage(fmt.Sprintf("Error in approval process: %v", err))
 		return false, fmt.Sprintf("Error: %v", err)
 	}
@@ -656,47 +617,54 @@ func (app *App) askForApproval(functionName, args string) (bool, string) {
 	var message string
 	if approved {
 		message = "Operation approved by user"
+		app.Logger.Log("Operation APPROVED by user.")
 	} else {
 		message = "Operation denied by user"
+		app.Logger.Log("Operation DENIED by user.")
 	}
 
 	app.ChatModel.AddSystemMessage(message)
+	app.ChatModel.ForceUpdateViewport()
 	return approved, message
 }
 
 // initRepositoryContext loads project-specific context from codex.md files
 func (app *App) initRepositoryContext() error {
+	app.Logger.Log("Initializing repository context...")
 	repoContext, err := app.loadRepositoryContext()
 	if err != nil {
+		app.Logger.Log("Error loading repository context: %v", err)
 		return err
 	}
 
 	if repoContext == "" {
-		// No project context found, that's fine
+		app.Logger.Log("No repository context found (codex.md files). Skipping.")
 		return nil
 	}
 
-	// Add the repository context as a system message
+	app.Logger.Log("Found repository context. Adding as system message.")
 	ctx := context.Background()
 	systemMsg := agent.Message{
 		Role:    "system",
 		Content: "Repository Context:\n" + repoContext,
 	}
 
-	// Add the message to the agent's history
+	app.Logger.Log("Sending repository context to agent history...")
 	_, err = app.Agent.SendMessage(ctx, []agent.Message{systemMsg}, func(itemJSON string) {
-		// No streamed response expected here, but handler signature must match.
-		// We could potentially log itemJSON if needed for debugging.
+		app.Logger.Log("Repository context SendMessage handler received item (should be empty): %s", itemJSON)
 	})
-	return err // Return the error from SendMessage
+	if err != nil {
+		app.Logger.Log("Error sending repository context to agent: %v", err)
+	}
+	return err
 }
 
 // loadRepositoryContext looks for and loads codex.md files
 func (app *App) loadRepositoryContext() (string, error) {
 	var contextParts []string
 
-	// Check for ProjectDocPath set in config (highest priority)
 	if app.Config.ProjectDocPath != "" {
+		app.Logger.Log("Loading project doc from specified path: %s", app.Config.ProjectDocPath)
 		data, err := os.ReadFile(app.Config.ProjectDocPath)
 		if err != nil {
 			return "", fmt.Errorf("failed to read project doc from path %s: %w", app.Config.ProjectDocPath, err)
@@ -704,55 +672,49 @@ func (app *App) loadRepositoryContext() (string, error) {
 		contextParts = append(contextParts, string(data))
 	}
 
-	// Look for codex.md in the current working directory
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", fmt.Errorf("failed to get current working directory: %w", err)
-	}
-
-	// Try to find the repository root by looking for a .git directory
+	cwd := app.Config.CWD
 	repoRoot, err := findRepositoryRoot(cwd)
 	if err == nil {
-		// Look for codex.md in the repo root (if different from cwd)
+		app.Logger.Log("Found repository root: %s", repoRoot)
 		if repoRoot != cwd {
 			repoRootDocPath := filepath.Join(repoRoot, "codex.md")
 			if _, err := os.Stat(repoRootDocPath); err == nil {
+				app.Logger.Log("Found codex.md in repository root: %s", repoRootDocPath)
 				data, err := os.ReadFile(repoRootDocPath)
 				if err == nil {
 					contextParts = append(contextParts, fmt.Sprintf("Repository Root codex.md:\n%s", string(data)))
 				}
 			}
 		}
+	} else {
+		app.Logger.Log("Could not find repository root starting from %s: %v", cwd, err)
 	}
 
-	// Look for codex.md in the current directory
 	cwdDocPath := filepath.Join(cwd, "codex.md")
 	if _, err := os.Stat(cwdDocPath); err == nil {
+		app.Logger.Log("Found codex.md in current directory: %s", cwdDocPath)
 		data, err := os.ReadFile(cwdDocPath)
 		if err == nil {
 			contextParts = append(contextParts, fmt.Sprintf("Current Directory codex.md:\n%s", string(data)))
 		}
 	}
 
-	// Return the combined context
-	return strings.Join(contextParts, "\n\n---\n\n"), nil
+	combinedContext := strings.Join(contextParts, "\n\n---\n\n")
+	app.Logger.Log("Combined repository context length: %d bytes", len(combinedContext))
+	return combinedContext, nil
 }
 
 // findRepositoryRoot walks up the directory tree to find the repository root
 func findRepositoryRoot(startDir string) (string, error) {
 	currentDir := startDir
 	for {
-		// Check if the current directory has a .git subdirectory
 		gitDir := filepath.Join(currentDir, ".git")
 		if _, err := os.Stat(gitDir); err == nil {
-			// Found the repository root
 			return currentDir, nil
 		}
 
-		// Move up to the parent directory
 		parentDir := filepath.Dir(currentDir)
 		if parentDir == currentDir {
-			// Reached the filesystem root without finding a repository
 			return "", fmt.Errorf("no git repository found")
 		}
 		currentDir = parentDir
@@ -768,60 +730,63 @@ func (app *App) SaveRollout() error {
 		}
 	}
 
-	// Update rollout data
 	app.CurrentRollout.UpdatedAt = time.Now()
 
-	// Get the messages from the history
 	history := app.Agent.GetHistory()
 	if history != nil {
 		app.CurrentRollout.Messages = history.GetMessages()
 	}
 
-	// If rollout path not set, create a default one
 	if app.RolloutPath == "" {
 		timestamp := time.Now().Format("20060102-150405")
 		homeDir, err := os.UserHomeDir()
 		if err != nil {
+			app.Logger.Log("Error getting home directory for rollout path: %v", err)
 			return fmt.Errorf("failed to get home directory: %w", err)
 		}
 
-		// Create rollouts directory if it doesn't exist
 		rolloutsDir := filepath.Join(homeDir, ".codex", "rollouts")
 		if err := os.MkdirAll(rolloutsDir, 0755); err != nil {
+			app.Logger.Log("Error creating rollouts directory %s: %v", rolloutsDir, err)
 			return fmt.Errorf("failed to create rollouts directory: %w", err)
 		}
-
 		app.RolloutPath = filepath.Join(rolloutsDir, fmt.Sprintf("codex-session-%s.json", timestamp))
 	}
 
-	// Marshal to JSON
+	app.Logger.Log("Saving rollout to: %s", app.RolloutPath)
 	data, err := json.MarshalIndent(app.CurrentRollout, "", "  ")
 	if err != nil {
+		app.Logger.Log("Error marshaling rollout: %v", err)
 		return fmt.Errorf("failed to marshal rollout: %w", err)
 	}
 
-	// Save to file
 	if err := os.WriteFile(app.RolloutPath, data, 0644); err != nil {
+		app.Logger.Log("Error writing rollout file %s: %v", app.RolloutPath, err)
 		return fmt.Errorf("failed to save rollout: %w", err)
 	}
 
+	app.Logger.Log("Rollout saved successfully.")
 	return nil
 }
 
 // LoadRollout loads a saved session from a file
 func (app *App) LoadRollout(path string) error {
+	app.Logger.Log("Loading rollout from: %s", path)
 	data, err := os.ReadFile(path)
 	if err != nil {
+		app.Logger.Log("Error reading rollout file %s: %v", path, err)
 		return fmt.Errorf("failed to read rollout file: %w", err)
 	}
 
 	var rollout AppRollout
 	if err := json.Unmarshal(data, &rollout); err != nil {
+		app.Logger.Log("Error unmarshaling rollout from %s: %v", path, err)
 		return fmt.Errorf("failed to unmarshal rollout: %w", err)
 	}
 
 	app.CurrentRollout = &rollout
 	app.RolloutPath = path
+	app.Logger.Log("Rollout loaded successfully. SessionID: %s, CreatedAt: %s", rollout.SessionID, rollout.CreatedAt)
 
 	// Add the messages to the chat model
 	for _, msg := range rollout.Messages {
@@ -834,6 +799,7 @@ func (app *App) LoadRollout(path string) error {
 			app.ChatModel.AddSystemMessage(msg.Content)
 		}
 	}
+	app.Logger.Log("Loaded %d messages from rollout into ChatModel.", len(rollout.Messages))
 
 	return nil
 }
@@ -842,7 +808,53 @@ func (app *App) LoadRollout(path string) error {
 // Ensure you have a proper logging mechanism (e.g., writing to a file)
 // For now, just print to stderr for visibility during execution.
 func logDebug(format string, args ...interface{}) {
-	// In a real app, use a proper logger (e.g., logrus, zap)
-	// and write to a file configured via CLI flags or config file.
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	// Check if the global logger is enabled before logging
+	if appLogger != nil && appLogger.IsEnabled() {
+		appLogger.Log(format, args...)
+	}
+	// No longer print to stderr by default
+	// fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+// Close closes the application and cleans up all resources
+func (app *App) Close() error {
+	app.Logger.Log("App.Close: Cleaning up resources...")
+
+	// Set the app as not running
+	app.IsRunning = false
+
+	// Cancel agent operations
+	if app.Agent != nil {
+		app.Logger.Log("App.Close: Cancelling agent...")
+		app.Agent.Cancel()
+		if err := app.Agent.Close(); err != nil {
+			app.Logger.Log("App.Close: Error closing agent: %v", err)
+			// Continue with cleanup despite errors
+		}
+	}
+
+	// Ensure sandbox is closed if needed
+	if closer, ok := app.Sandbox.(io.Closer); ok {
+		app.Logger.Log("App.Close: Closing sandbox...")
+		if err := closer.Close(); err != nil {
+			app.Logger.Log("App.Close: Error closing sandbox: %v", err)
+			// Continue with cleanup despite errors
+		}
+	}
+
+	// Save current session state if needed
+	app.Logger.Log("App.Close: Saving rollout...")
+	if err := app.SaveRollout(); err != nil {
+		app.Logger.Log("App.Close: Error saving rollout: %v", err)
+		// Continue with cleanup despite errors
+	}
+
+	// Close the agent message channel to unblock any waiting goroutines
+	if app.agentMsgChan != nil {
+		app.Logger.Log("App.Close: Closing agent message channel...")
+		close(app.agentMsgChan)
+	}
+
+	app.Logger.Log("App.Close: Cleanup complete")
+	return nil
 }

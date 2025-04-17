@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/epuerta/codex-go/internal/agent"
+	"github.com/epuerta/codex-go/internal/logging"
 	"github.com/google/uuid"
 )
 
@@ -118,10 +119,11 @@ type ChatModel struct {
 	ready          bool
 	width          int
 	height         int
-	agent          agent.Agent // Reference to the agent for history access
-	showTimestamps bool        // Whether to show timestamps
-	hideSystemMsgs bool        // Whether to hide system messages
-	lastResponseID string      // To track the last response for the live update
+	agent          agent.Agent    // Reference to the agent for history access
+	showTimestamps bool           // Whether to show timestamps
+	hideSystemMsgs bool           // Whether to hide system messages
+	lastResponseID string         // To track the last response for the live update
+	logger         logging.Logger // Add logger field
 
 	// Fields for thinking state
 	isThinking    bool
@@ -154,8 +156,9 @@ func NewChatModel() ChatModel {
 		hideSystemMsgs: true,
 		sessionID:      fmt.Sprintf("%08x", uuid.New().ID()),
 		workDir:        getWorkDir(),
-		model:          "o4-mini", // Default model
-		approvalMode:   "suggest", // Default approval mode
+		model:          "o4-mini",            // Default model
+		approvalMode:   "suggest",            // Default approval mode
+		logger:         &logging.NilLogger{}, // Default to nil logger
 	}
 }
 
@@ -203,6 +206,15 @@ func (m *ChatModel) SetOnSendMessage(callback func(content string)) {
 	m.onSendMessage = callback
 }
 
+// SetLogger sets the logger for the model
+func (m *ChatModel) SetLogger(logger logging.Logger) {
+	if logger != nil {
+		m.logger = logger
+	} else {
+		m.logger = &logging.NilLogger{}
+	}
+}
+
 // Init initializes the model
 func (m ChatModel) Init() tea.Cmd {
 	return tea.Batch(textinput.Blink, tea.EnterAltScreen, m.thinkTick())
@@ -229,8 +241,10 @@ func (m *ChatModel) AddUserMessage(content string) {
 
 // AddAssistantMessage adds an assistant message to the local messages
 func (m *ChatModel) AddAssistantMessage(content string) {
-	// Add temporary debug
-	fmt.Fprintf(os.Stderr, "DEBUG: AddAssistantMessage called with content length: %d\n", len(content))
+	// Use logger instead of direct stderr output
+	if m.logger != nil && m.logger.IsEnabled() {
+		m.logger.Log("AddAssistantMessage called with content length: %d", len(content))
+	}
 
 	m.AddMessage(Message{
 		Role:      "assistant",
@@ -250,8 +264,10 @@ func (m *ChatModel) AddSystemMessage(content string) {
 
 // AddFunctionCallMessage adds a function call message to the local messages
 func (m *ChatModel) AddFunctionCallMessage(name, args string) {
-	// Add temporary debug print
-	fmt.Fprintf(os.Stderr, "DEBUG: AddFunctionCallMessage called with name: %s\n", name)
+	// Use logger instead of direct stderr output
+	if m.logger != nil && m.logger.IsEnabled() {
+		m.logger.Log("AddFunctionCallMessage called with name: %s", name)
+	}
 
 	m.AddMessage(Message{
 		Role:      "function_call",
@@ -262,8 +278,10 @@ func (m *ChatModel) AddFunctionCallMessage(name, args string) {
 
 // AddFunctionResultMessage adds a function result message to the local messages
 func (m *ChatModel) AddFunctionResultMessage(result string, isError bool) {
-	// Add temporary debug print
-	fmt.Fprintf(os.Stderr, "DEBUG: AddFunctionResultMessage called with isError: %v\n", isError)
+	// Use logger instead of direct stderr output
+	if m.logger != nil && m.logger.IsEnabled() {
+		m.logger.Log("AddFunctionResultMessage called with isError: %v", isError)
+	}
 
 	m.AddMessage(Message{
 		Role:      "function_result",
@@ -275,8 +293,10 @@ func (m *ChatModel) AddFunctionResultMessage(result string, isError bool) {
 
 // UpdateLastAssistantMessage updates the content of the last assistant message
 func (m *ChatModel) UpdateLastAssistantMessage(additionalContent string) {
-	// Add debug
-	fmt.Fprintf(os.Stderr, "DEBUG: UpdateLastAssistantMessage called with content length: %d\n", len(additionalContent))
+	// Use logger instead of direct stderr output
+	if m.logger != nil && m.logger.IsEnabled() {
+		m.logger.Log("UpdateLastAssistantMessage called with content length: %d", len(additionalContent))
+	}
 
 	// Find the last assistant message
 	for i := len(m.messages) - 1; i >= 0; i-- {
@@ -285,7 +305,9 @@ func (m *ChatModel) UpdateLastAssistantMessage(additionalContent string) {
 			// Assuming the full message content comes in each chunk for now
 			// To append: m.messages[i].Content += additionalContent
 			m.messages[i].Content = additionalContent
-			fmt.Fprintf(os.Stderr, "DEBUG: Updated assistant message at index %d\n", i)
+			if m.logger != nil && m.logger.IsEnabled() {
+				m.logger.Log("Updated assistant message at index %d", i)
+			}
 
 			// Update the viewport if ready
 			if m.ready {
@@ -296,7 +318,9 @@ func (m *ChatModel) UpdateLastAssistantMessage(additionalContent string) {
 	}
 
 	// If no assistant message found, create a new one
-	fmt.Fprintf(os.Stderr, "DEBUG: No existing assistant message found, creating new one\n")
+	if m.logger != nil && m.logger.IsEnabled() {
+		m.logger.Log("No existing assistant message found, creating new one")
+	}
 	m.AddAssistantMessage(additionalContent)
 }
 
@@ -870,14 +894,18 @@ func wordWrap(text string, width int) string {
 	return sb.String()
 }
 
-// AddCommandMessage adds a command execution message (Command + Result)
+// AddCommandMessage adds a command execution message to the local messages
 func (m *ChatModel) AddCommandMessage(cmdStr string, result *CommandResult) {
-	fmt.Fprintf(os.Stderr, "DEBUG: AddCommandMessage called with command: %s\n", cmdStr)
+	// Use logger instead of direct stderr output
+	if m.logger != nil && m.logger.IsEnabled() {
+		m.logger.Log("AddCommandMessage called with command: %s", cmdStr)
+	}
+
 	m.AddMessage(Message{
-		Role:          "command", // Special role for formatting
-		Content:       cmdStr,    // Store original command in Content
-		CommandResult: result,    // Store the detailed result
+		Role:          "command",
+		Content:       cmdStr,
 		Timestamp:     time.Now(),
+		CommandResult: result,
 	})
 }
 
