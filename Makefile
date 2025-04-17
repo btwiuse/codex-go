@@ -23,7 +23,7 @@ help:
 build:
 	@echo "Building Codex-Go..."
 	@mkdir -p $(BUILD_DIR)
-	$(GO) build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) cmd/codex/main.go
+	$(GO) build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/codex
 
 test:
 	@echo "Running tests..."
