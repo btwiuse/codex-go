@@ -1,185 +1,182 @@
 # Codex-Go
 
-A Go port of the OpenAI Codex CLI - a lightweight coding agent that runs in your terminal.
-4/18/2025 : WIP This project is under heavy development. Working on releasing a working build shortly with an updated read me
+An experimental AI coding assistant that runs in your terminal, modeled after the concepts of [openai/codex](https://github.com/openai/codex).
 
-- making it MCP server
-- Library
-- parity with original CODEX 
+**Status:** This project is in an early, experimental phase and under active development. Expect breaking changes and potential instability.
+
+**Note:** This project is part of CloudshipAI's mission to help make OSS tools for AI developers and engineers. [Learn more about CloudshipAI](https://cloudshipai.com). This is a tool we plan to incorporate into our platform and want to make it available to the community.
 
 ## Overview
 
-Codex-Go is a terminal-based coding assistant that can:
+Codex-Go aims to provide a terminal-based coding assistant implemented in Go, with the following long-term goals:
 
-- Answer questions about code
-- Write and execute code for you
-- Make changes to your codebase
-- Explain concepts and provide solutions
+1.  **Core Functionality (Go Library):** A robust Go library for interacting with LLMs (like OpenAI's models) for code generation, explanation, and modification tasks.
+2.  **In-Terminal Agent:** A user-friendly terminal application (powered by Bubble Tea) allowing developers to chat with the agent, request code changes, execute commands, and get help with their codebase.
+3.  **MCP Server:** Integration as a [Mission Control Platform (MCP)](https://example.com/mcp-explanation) server component, enabling its capabilities to be used within broader operational workflows (details TBD).
+4.  **Library Parity:** Achieve functional parity with the original `openai/codex` reference where applicable, focusing on file operations and command execution within a secure sandbox.
 
-It's implemented in Go with a focus on performance, security, and extensibility.
+Currently, the primary focus is on the **In-Terminal Agent**.
+
+## Features (Current & Planned)
+
+-   Interact with an AI coding assistant directly in your terminal.
+-   Ask questions about your code.
+-   Request code generation or modification.
+-   Safely execute shell commands proposed by the AI (with user approval).
+-   Apply file patches proposed by the AI (with user approval).
+-   Context-aware assistance using project documentation (`codex.md`).
+-   Configurable safety levels (approval modes).
 
 ## Installation
 
-### Prerequisites
+### 1. From Release (Recommended)
 
-- Go 1.18 or higher
-- OpenAI API Key
+Pre-built binaries for Linux, macOS, and Windows are available on the [GitHub Releases](https://github.com/epuerta9/codex-go/releases) page.
 
-### Building from source
+1.  Go to the [Latest Release](https://github.com/epuerta9/codex-go/releases/latest).
+2.  Download the appropriate archive (`.tar.gz` or `.zip`) for your operating system and architecture.
+3.  Extract the `codex-go` binary from the archive.
+4.  (Optional but recommended) Move the `codex-go` binary to a directory included in your system's `PATH` (e.g., `/usr/local/bin`, `~/bin`).
+
+    ```bash
+    # Example for Linux/macOS:
+    mv codex-go /usr/local/bin/
+    chmod +x /usr/local/bin/codex-go
+    ```
+
+### 2. Building from Source
+
+#### Prerequisites
+
+-   Go 1.21 or higher ([Installation Guide](https://go.dev/doc/install))
+-   Git
+
+#### Steps
 
 ```bash
 # Clone the repository
 git clone https://github.com/epuerta9/codex-go.git
 cd codex-go
 
-# Build the binary
-go build -o codex ./cmd/codex
+# Build the binary (output will be named 'codex-go' in the current directory)
+go build -o codex-go ./cmd/codex
 
-# Make executable
-chmod +x codex
+# (Optional) Install to your Go bin path
+go install ./cmd/codex
 
-# Move to a location in your PATH (optional)
-sudo mv codex /usr/local/bin/
+# (Optional) Or move the built binary to your preferred location
+# mv codex-go /usr/local/bin/
 ```
-
-## Usage
-
-### Set your OpenAI API key
-
-Make sure your `OPENAI_API_KEY` environment variable is set:
-
-```bash
-export OPENAI_API_KEY="your-api-key-here"
-```
-
-You can add this to your `.bashrc` or `.zshrc` file for persistence.
-
-### Running Codex-Go
-
-There are two primary ways to run the application:
-
-1.  **Interactive Mode:**
-    Start the application without any arguments to enter the interactive chat mode:
-    ```bash
-    codex
-    ```
-    In this mode, you can have a back-and-forth conversation with the AI. Type your message and press Enter.
-
-2.  **Direct Prompt Mode (Quiet Mode):**
-    Provide a prompt directly using the `-q` or `--quiet` flag:
-    ```bash
-    codex -q "Write a Go function to parse JSON"
-    ```
-    The AI will process the prompt and print the final response to standard output. This is useful for quick tasks or scripting.
-
-### Interactive Mode Keybindings
-
-While in interactive mode, you can use the following keybindings:
-
--   `Enter`: Send the message currently typed in the input box.
--   `Ctrl+T`: Toggle the display of timestamps for each message.
--   `Ctrl+S`: Toggle the display of system messages (like initial prompts or debug messages).
--   `Ctrl+X`: Clear the current conversation history. This will start a fresh context for the AI.
--   `Ctrl+C` or `Esc`: Quit the application.
-
-### Flags
-
-- `--model, -m`: Specify the model to use (default: "gpt-4o").
-- `--approval-mode, -a`: Set the approval mode: "suggest", "auto-edit", or "full-auto".
-- `--quiet, -q`: Use non-interactive mode (requires a prompt).
-- `--image, -i`: Include image file(s) as input (not fully implemented yet).
-- `--no-project-doc`: Don't include the repository's codex.md file.
-- `--project-doc`: Include an additional markdown file as context.
-- `--full-stdout`: Don't truncate command outputs.
-
-## Security & Approval Modes
-
-Codex-Go lets you decide how much autonomy the agent receives through the `--approval-mode` flag:
-
-| Mode                      | What the agent may do without asking            | Still requires approval                                         |
-| ------------------------- | ----------------------------------------------- | --------------------------------------------------------------- |
-| **Suggest** <br>(default) | • Read any file in the repo                     | • **All** file writes/patches <br>• **All** shell/Bash commands |
-| **Auto Edit**             | • Read **and** apply‑patch writes to files      | • **All** shell/Bash commands                                   |
-| **Full Auto**             | • Read/write files <br>• Execute shell commands | –                                                               |
-
-In all modes, shell commands are run with restricted environments for safety, and different sandboxing methods are used depending on your platform:
-
-- **macOS**: Uses `sandbox-exec` to restrict file access and network connectivity.
-- **Linux**: Uses environment restrictions and directory isolation.
-- **Other platforms**: Uses basic sandboxing with environment and directory restrictions.
 
 ## Configuration
 
-Codex-Go looks for configuration files in `~/.codex/`:
+1.  **OpenAI API Key:**
+    Codex-Go requires an OpenAI API key. Set it as an environment variable:
+    ```bash
+    export OPENAI_API_KEY="your-api-key-here"
+    ```
+    Add this line to your shell configuration file (e.g., `.bashrc`, `.zshrc`, `.profile`) for persistence.
 
-- `config.yaml`: Basic configuration (e.g., default model, approval mode).
-  ```yaml
-  # Example ~/.codex/config.yaml
-  model: gpt-4o
-  approval_mode: suggest
-  ```
-- `instructions.md`: Custom instructions prepended to the system prompt for the AI.
-  ```markdown
-  # Example ~/.codex/instructions.md
-  Always format code blocks using markdown.
-  Be concise.
-  ```
+2.  **(Optional) Configuration File (`~/.codex/config.yaml`):**
+    You can customize default behavior:
+    ```yaml
+    # Example ~/.codex/config.yaml
+    model: gpt-4o-mini # Default model
+    approval_mode: suggest # Default approval mode (suggest, auto-edit, full-auto)
+    # log_file: ~/.codex/codex-go.log # Uncomment to enable file logging
+    # log_level: debug # Log level (debug, info, warn, error)
+    # disable_project_doc: false # Set to true to ignore codex.md files
+    ```
 
-Codex-Go also supports project-specific documentation through `codex.md` files:
+3.  **(Optional) Custom Instructions (`~/.codex/instructions.md`):**
+    Provide persistent custom instructions to the AI agent by creating this file.
+    ```markdown
+    # Example ~/.codex/instructions.md
+    Always format Go code using gofmt.
+    Keep responses concise.
+    ```
 
-1. `codex.md` at repository root - General project context
-2. `codex.md` in current directory - Local directory-specific context
+4.  **(Optional) Project Context (`codex.md`):**
+    Place `codex.md` files in your project for context:
+    -   `codex.md` at the repository root (found via `.git` directory).
+    -   `codex.md` in the current working directory.
+    Both will be included if found (unless disabled via config or flag).
+
+## Usage
+
+### Interactive Mode
+
+Start the application without arguments:
+
+```bash
+codex-go
+```
+
+Chat with the assistant. Press `Enter` to send your message.
+
+**Keybindings:**
+
+-   `Enter`: Send message.
+-   `Ctrl+T`: Toggle message timestamps.
+-   `Ctrl+S`: Toggle system/debug messages.
+-   `/clear`: Clear the current conversation history.
+-   `/help`: Show command help.
+-   `Ctrl+C` or `Esc` or `q` (when input empty): Quit.
+
+### Direct Prompt Mode (Quiet)
+
+Execute a single prompt non-interactively:
+
+```bash
+codex-go -q "Refactor this Go function to improve readability: [paste code here]"
+```
+The response will be printed directly to standard output.
+
+### Flags
+
+-   `--model`, `-m`: Specify the model (e.g., `gpt-4o`, `gpt-4o-mini`).
+-   `--approval-mode`, `-a`: Set approval mode (`suggest`, `auto-edit`, `full-auto`).
+-   `--quiet`, `-q`: Use non-interactive mode (requires a prompt).
+-   `--no-project-doc`: Don't include `codex.md` files.
+-   `--project-doc <path>`: Include an additional specific markdown file as context.
+-   `--config <path>`: Specify a path to a config file (overrides default `~/.codex/config.yaml`).
+-   `--instructions <path>`: Specify a path to an instructions file (overrides default `~/.codex/instructions.md`).
+-   `--log-file <path>`: Specify a log file path.
+-   `--log-level <level>`: Set log level (`debug`, `info`, `warn`, `error`).
+
+## Security & Approval Modes
+
+Control the agent's autonomy with `--approval-mode`:
+
+| Mode          | Allows without asking                | Requires approval                       |
+|---------------|--------------------------------------|-----------------------------------------|
+| **suggest**   | Read files, List directories         | File writes/patches, Command execution  |
+| **auto-edit** | Read files, Apply file patches       | Command execution                       |
+| **full-auto** | Read files, Apply patches, Execute commands | ---                                     |
+
+**Note:** `full-auto` mode can execute *any* command the AI suggests without confirmation. Use with extreme caution.
+
+Commands are executed within a sandbox environment (using platform features like `sandbox-exec` on macOS where possible) to limit potential harm, but caution is always advised.
 
 ## Development
 
-### Running tests
+(See [CONTRIBUTING.md](CONTRIBUTING.md) - *if you create one*)
+
+### Running Tests
 
 ```bash
-# Run all tests
 go test ./...
-
-# Run specific tests
-go test ./internal/agent/... 
 ```
 
 ### Using the Makefile
 
-The project includes a Makefile for common tasks:
-
 ```bash
-# Build the binary
 make build
-
-# Run tests
 make test
-
-# Run linters (if configured)
-# make lint 
-
-# Clean build artifacts
-make clean
-
-# Run the application (interactive)
-make run
-
-# Run the application (quiet mode with prompt)
 make run PROMPT="Explain Go interfaces"
-
-# Show help
 make help
 ```
 
-### Project structure
-
-- `cmd/codex`: Command-line interface (main, root command, app model).
-- `internal/agent`: AI agent implementation (OpenAI client, history management).
-- `internal/config`: Configuration loading and handling.
-- `internal/ui`: Terminal UI components (Bubble Tea chat model, approval UI).
-- `internal/sandbox`: Secure command execution (platform-specific sandboxing).
-- `internal/fileops`: File operations.
-
 ## License
 
-Apache-2.0 License 
-
-from the new codex
+Apache-2.0
