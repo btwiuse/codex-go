@@ -10,9 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/epuerta/codex-go/internal/agent"
 	"github.com/epuerta/codex-go/internal/config"
+	"github.com/epuerta/codex-go/internal/fileops"
 	"github.com/epuerta/codex-go/internal/functions"
 	"github.com/epuerta/codex-go/internal/logging"
 	"github.com/epuerta/codex-go/internal/sandbox"
@@ -76,6 +78,12 @@ type App struct {
 	agentMsgChan      chan tea.Msg // Channel for agent messages
 	isFirstAgentChunk bool         // Track if we are processing the first chunk of a stream
 	isAgentProcessing bool         // Track if the agent is busy with a request/response cycle
+
+	// State for Approval UI
+	isAwaitingApproval  bool
+	approvalModel       ui.ApprovalModel
+	pendingFunctionCall *agent.FunctionCall // Store the function call needing approval
+	pendingApprovalArgs string              // Store the specific args shown in the prompt
 }
 
 // AppRollout represents a saved session that can be loaded later
@@ -138,7 +146,9 @@ func NewApp(config *config.Config, logger logging.Logger) (*App, error) {
 		IsRunning:        false,
 		Sandbox:          sb,
 		Logger:           logger,
-		agentMsgChan:     make(chan tea.Msg), // Initialize channel
+		agentMsgChan:     make(chan tea.Msg),
+		// Initialize approval state
+		isAwaitingApproval: false,
 	}
 
 	logger.Log("Repository context check: DisableProjectDoc=%t", config.DisableProjectDoc)
@@ -174,21 +184,188 @@ func (app *App) listenForAgentMessages() tea.Cmd {
 // Update handles messages for the application model
 func (app *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
+	var cmds []tea.Cmd // Use a slice for batching
 	var agentMessageHandled bool = false
 	var skipChatModelUpdate bool = false
 
-	app.Logger.Log("App.Update received msg type: %T", msg)
+	app.Logger.Log("App.Update received msg type: %T, isAwaitingApproval: %t", msg, app.isAwaitingApproval)
+
+	// *** Approval UI Handling ***
+	if app.isAwaitingApproval {
+		switch approvalMsg := msg.(type) {
+		case ui.ApprovalResultMsg:
+			app.Logger.Log("Received ApprovalResultMsg: Approved=%t", approvalMsg.Approved)
+			app.isAwaitingApproval = false // Exit approval mode
+
+			app.ChatModel.SetThinkingStatus("Processing function result...")
+
+			var agentOutput string
+			var success bool
+			functionName := app.pendingFunctionCall.Name
+			handlerExecuted := false // Flag to prevent fallthrough
+
+			if approvalMsg.Approved {
+				app.Logger.Log("Approval granted for %s. Executing...", functionName)
+
+				// *** Execute the approved function ***
+				if functionName == "execute_command" {
+					handlerExecuted = true // Mark as handled
+					cmdStr := app.pendingApprovalArgs
+					app.Logger.Log("Executing approved command via sandbox: %s", cmdStr)
+					result, err := app.Sandbox.Execute(context.Background(), sandbox.SandboxOptions{Command: cmdStr, WorkingDir: app.Config.CWD, Timeout: 30 * time.Second})
+					uiResult := &ui.CommandResult{Command: cmdStr, Stdout: result.Stdout, Stderr: result.Stderr, ExitCode: result.ExitCode, Duration: result.Duration, Error: err}
+					app.ChatModel.AddCommandMessage(cmdStr, uiResult)
+					app.ChatModel.ForceUpdateViewport()
+					agentOutput = result.Stdout
+					success = err == nil && result.ExitCode == 0
+					if !success {
+						if err != nil {
+							agentOutput = fmt.Sprintf("Execution Error: %v", err)
+						} else {
+							agentOutput = fmt.Sprintf("Command Failed (code %d): %s", result.ExitCode, result.Stderr)
+						}
+					}
+					app.Logger.Log("Executed command. Agent output: %s, Success: %t", agentOutput, success)
+
+				} else if functionName == "patch_file" {
+					handlerExecuted = true // Mark as handled
+					patchContent := app.pendingApprovalArgs
+					app.Logger.Log("Executing approved patch. Content length: %d", len(patchContent))
+					app.ChatModel.SetThinkingStatus("Applying patch...")
+					app.Logger.Log("Calling fileops.ParseCustomPatch...")
+					operations, parseErr := fileops.ParseCustomPatch(patchContent)
+					if parseErr != nil {
+						app.Logger.Log("ERROR: Failed to parse custom patch: %v", parseErr)
+						agentOutput = fmt.Sprintf("Error parsing patch: %v", parseErr)
+						success = false
+						patchResMsg := &fileops.CustomPatchResult{Success: false, Error: parseErr, Operation: "parse_patch"}
+						app.Logger.Log("Adding patch parse error message to UI: %+v", *patchResMsg)
+						app.ChatModel.AddPatchResultMessage(patchResMsg)
+						app.Logger.Log("Calling ForceUpdateViewport after adding parse error.")
+						app.ChatModel.ForceUpdateViewport()
+						app.Logger.Log("ForceUpdateViewport completed after adding parse error.")
+					} else {
+						app.Logger.Log("Parsed %d operations from patch. Calling fileops.ApplyCustomPatch...", len(operations))
+						applyResults, applyErr := fileops.ApplyCustomPatch(operations)
+						app.Logger.Log("ApplyCustomPatch finished. Results count: %d, Overall error: %v", len(applyResults), applyErr)
+
+						successCount, failureCount := 0, 0
+						// Log chat messages state before adding results (Removed GetMessageCount call)
+						app.Logger.Log("Adding patch results to UI...")
+						for i, res := range applyResults {
+							app.Logger.Log("Processing applyResult %d: Success=%t, Path=%s, Op=%s, Error=%v", i+1, res.Success, res.Path, res.Operation, res.Error)
+							if res.Success {
+								successCount++
+							} else {
+								failureCount++
+							}
+							// Log before adding
+							app.Logger.Log("Adding patch result message %d to UI: %+v", i+1, *res)
+							app.ChatModel.AddPatchResultMessage(res)
+							// Log before forcing update
+							app.Logger.Log("Calling ForceUpdateViewport after adding result %d.", i+1)
+							app.ChatModel.ForceUpdateViewport()
+							app.Logger.Log("ForceUpdateViewport completed for result %d.", i+1)
+						}
+						app.Logger.Log("Finished adding %d patch result messages to ChatModel.", len(applyResults))
+						// Log chat messages state after adding results (Removed GetMessageCount call)
+						app.Logger.Log("Finished processing patch apply results.")
+
+						if applyErr != nil {
+							agentOutput = fmt.Sprintf("Patch application finished with errors. Succeeded: %d, Failed: %d. First error: %v", successCount, failureCount, applyErr)
+							success = false
+						} else if failureCount > 0 {
+							agentOutput = fmt.Sprintf("Patch application finished. Succeeded: %d, Failed: %d.", successCount, failureCount)
+							success = false
+						} else {
+							agentOutput = fmt.Sprintf("Patch application finished successfully. Operations applied: %d.", successCount)
+							success = true
+						}
+						app.Logger.Log("Patch application summary for agent: %s", agentOutput)
+					}
+				}
+
+				// *** Generic Handler for other approved functions (if not handled above) ***
+				if !handlerExecuted {
+					fn := app.FunctionRegistry.Get(functionName)
+					if fn != nil {
+						app.Logger.Log("Executing approved registered function: %s", functionName)
+						app.ChatModel.SetThinkingStatus(fmt.Sprintf("Executing: %s", functionName))
+						result, err := fn(app.pendingFunctionCall.Arguments)
+						app.Logger.Log("Approved Function '%s' execution result: ResultLen=%d, Error=%v", functionName, len(result), err)
+						success = err == nil
+						agentOutput = result
+						if err != nil {
+							agentOutput = fmt.Sprintf("Error: %v", err)
+							app.ChatModel.AddSystemMessage(agentOutput)
+						}
+						app.ChatModel.AddFunctionResultMessage(agentOutput, !success)
+						app.ChatModel.ForceUpdateViewport()
+					} else {
+						app.Logger.Log("ERROR: Approved function %s not found in registry!", functionName)
+						agentOutput = fmt.Sprintf("Internal error: approved function %s not found", functionName)
+						success = false
+					}
+				}
+			} else { // Denied
+				agentOutput = fmt.Sprintf("Operation '%s' denied by user.", functionName)
+				success = false
+				app.Logger.Log("Approval denied for %s.", functionName)
+				app.ChatModel.AddSystemMessage(agentOutput)
+				app.ChatModel.ForceUpdateViewport()
+			}
+
+			// --- Send result back to agent ---
+			resultMsg := sendFunctionResultMsg{
+				ctx:          context.Background(),
+				functionName: app.pendingFunctionCall.Name,
+				callID:       app.pendingFunctionCall.ID,
+				originalArgs: app.pendingFunctionCall.Arguments,
+				output:       agentOutput,
+				success:      success,
+			}
+			app.Logger.Log("App.Update (ApprovalResultMsg): Starting goroutine to send sendFunctionResultMsg for %s.", resultMsg.functionName)
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				app.agentMsgChan <- resultMsg
+			}()
+			app.pendingFunctionCall = nil
+			app.pendingApprovalArgs = ""
+
+			skipChatModelUpdate = true
+
+		case tea.KeyMsg, tea.MouseMsg: // Pass other messages to approval model
+			app.Logger.Log("Passing msg %T to ApprovalModel", msg)
+			var updatedApprovalModel ui.ApprovalModel
+			updatedApprovalModel, cmd = app.approvalModel.Update(msg)
+			app.approvalModel = updatedApprovalModel
+			cmds = append(cmds, cmd)
+			skipChatModelUpdate = true
+
+		default:
+			app.Logger.Log("Ignoring msg %T while awaiting approval", msg)
+			skipChatModelUpdate = true
+		}
+		// Return early to avoid processing other cases while approval is active
+		return app, tea.Batch(cmds...)
+	}
+	// *** End Approval UI Handling ***
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		app.Logger.Log("Received WindowSizeMsg: Width=%d, Height=%d", msg.Width, msg.Height)
 		app.width = msg.Width
 		app.height = msg.Height
+		// Pass size to approval model if active
+		if app.isAwaitingApproval {
+			app.approvalModel.SetSize(msg.Width, msg.Height)
+		}
 
 	case tea.KeyMsg:
 		app.Logger.Log("Received KeyMsg: Type=%v, Rune=%q, Alt=%t", msg.Type, msg.Runes, msg.Alt)
 		if msg.Type == tea.KeyCtrlC || msg.Type == tea.KeyEsc || (msg.String() == "q" && app.ChatModel.InputIsEmpty()) {
 			app.Logger.Log("Quit key detected. Shutting down.")
+			app.Agent.Cancel() // Cancel any pending agent work
 			app.IsRunning = false
 			return app, tea.Quit
 		}
@@ -238,7 +415,11 @@ func (app *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case agentResponseMsg:
 		app.Logger.Log("Received agentResponseMsg")
 		app.handleAgentResponseItem(msg.item)
-		cmd = app.listenForAgentMessages()
+		// Refocus input *unless* we are now awaiting approval
+		if !app.isAwaitingApproval {
+			cmds = append(cmds, textinput.Blink)
+		}
+		cmds = append(cmds, app.listenForAgentMessages()) // Ensure we continue listening
 		agentMessageHandled = true
 		skipChatModelUpdate = true
 
@@ -248,7 +429,7 @@ func (app *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		app.ChatModel.StopThinking()
 		app.isFirstAgentChunk = false
 		app.isAgentProcessing = false
-		cmd = app.listenForAgentMessages()
+		cmds = append(cmds, app.listenForAgentMessages(), textinput.Blink)
 		agentMessageHandled = true
 		skipChatModelUpdate = true
 
@@ -257,7 +438,7 @@ func (app *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		app.ChatModel.StopThinking()
 		app.isFirstAgentChunk = false
 		app.isAgentProcessing = false
-		cmd = app.listenForAgentMessages()
+		cmds = append(cmds, app.listenForAgentMessages(), textinput.Blink)
 		agentMessageHandled = true
 		skipChatModelUpdate = true
 
@@ -266,14 +447,14 @@ func (app *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		app.ChatModel.StopThinking()
 		app.isFirstAgentChunk = false
 		app.isAgentProcessing = false
-		cmd = app.listenForAgentMessages()
+		cmds = append(cmds, app.listenForAgentMessages(), textinput.Blink)
 		agentMessageHandled = true
 		skipChatModelUpdate = true
 
 	case sendFunctionResultMsg:
 		app.Logger.Log("Received sendFunctionResultMsg for %s", msg.functionName)
 		app.sendFunctionResultCmd(msg)
-		cmd = app.listenForAgentMessages()
+		cmds = append(cmds, app.listenForAgentMessages())
 		agentMessageHandled = true
 		skipChatModelUpdate = true
 
@@ -286,8 +467,12 @@ func (app *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if updatedChatModelTyped, ok := updatedChatModel.(ui.ChatModel); ok {
 			app.ChatModel = updatedChatModelTyped
 		}
-	} else if cmd == nil {
-		app.Logger.Log("Skipped ChatModel.Update for %T, cmd is nil", msg)
+		cmds = append(cmds, cmd)
+	} else if !agentMessageHandled && len(cmds) == 0 {
+		// If we skipped chat model update AND no other command was generated AND it wasn't an agent message we handled,
+		// we still need to re-listen for agent messages.
+		app.Logger.Log("Skipped ChatModel.Update for %T, no other command/agent message. Ensuring agent listener continues.", msg)
+		cmds = append(cmds, app.listenForAgentMessages())
 	}
 
 	if agentMessageHandled {
@@ -295,20 +480,28 @@ func (app *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		app.ChatModel.ForceUpdateViewport()
 	}
 
-	if cmd != nil {
-		app.Logger.Log("App.Update returning command: %T", cmd)
-		return app, cmd
+	if len(cmds) > 0 {
+		batchCmd := tea.Batch(cmds...)
+		app.Logger.Log("App.Update returning %d command(s).", len(cmds))
+		return app, batchCmd
 	}
 
 	app.Logger.Log("App.Update finished for %T, returning nil command", msg)
-	return app, nil
+	// Ensure we always return a command to listen for the next agent message if nothing else is pending
+	return app, app.listenForAgentMessages()
 }
 
 // View renders the application UI
 func (app *App) View() string {
-	// Logging in View can be very noisy, avoid unless necessary
-	// app.Logger.Log("App.View called")
-	return app.ChatModel.View()
+	if app.isAwaitingApproval {
+		// Ensure the approval model has the correct size based on current terminal dimensions
+		app.approvalModel.SetSize(app.width, app.height)
+		// Render the approval UI (it handles its own centering via lipgloss.Place)
+		approvalView := app.approvalModel.View()
+		return approvalView
+	} else {
+		return app.ChatModel.View()
+	}
 }
 
 // listenAgentStreamCmd starts the agent stream goroutine which sends messages to app.agentMsgChan
@@ -404,15 +597,48 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) {
 
 	case "function_call":
 		if item.FunctionCall != nil {
-			app.Logger.Log("Handling 'function_call' item. Name: %s, ID: %s, Args: %q", item.FunctionCall.Name, item.FunctionCall.ID, item.FunctionCall.Arguments)
-			app.ChatModel.SetThinkingStatus(fmt.Sprintf("Calling %s...", item.FunctionCall.Name))
+			app.Logger.Log("Handling 'function_call' item. Name: %s, ID: %s, Full Args JSON: %s", item.FunctionCall.Name, item.FunctionCall.ID, item.FunctionCall.Arguments)
+			app.ChatModel.SetThinkingStatus(fmt.Sprintf("Evaluating %s...", item.FunctionCall.Name))
 			app.ChatModel.AddFunctionCallMessage(item.FunctionCall.Name, item.FunctionCall.Arguments)
 			app.ChatModel.ForceUpdateViewport()
 
-			statusMsg := fmt.Sprintf("Executing function: %s", item.FunctionCall.Name)
-			app.ChatModel.AddSystemMessage(statusMsg)
-			app.ChatModel.ForceUpdateViewport()
+			// --- Decide if Approval Needed --- Moved earlier
+			needsApproval := app.needsApprovalForFunction(item.FunctionCall.Name)
+			var argsForApproval string
+			if needsApproval {
+				if item.FunctionCall.Name == "execute_command" || item.FunctionCall.Name == "patch_file" || item.FunctionCall.Name == "write_file" {
+					var argsMap map[string]interface{}
+					if err := json.Unmarshal([]byte(item.FunctionCall.Arguments), &argsMap); err == nil {
+						if cmd, ok := argsMap["command"].(string); ok {
+							argsForApproval = cmd
+						} else if patch, ok := argsMap["code_edit"].(string); ok {
+							argsForApproval = patch
+						} else if patch, ok := argsMap["patch_content"].(string); ok {
+							argsForApproval = patch
+						} else if content, ok := argsMap["content"].(string); ok {
+							argsForApproval = content
+						} else {
+							argsForApproval = item.FunctionCall.Arguments
+						}
+					} else {
+						argsForApproval = item.FunctionCall.Arguments
+					}
+				} else {
+					argsForApproval = item.FunctionCall.Arguments
+				}
+			}
+			app.Logger.Log("Determined argsForApproval: %s", argsForApproval)
 
+			if needsApproval {
+				app.Logger.Log("Function %s requires approval. Triggering approval state.", item.FunctionCall.Name)
+				app.askForApproval(item.FunctionCall.Name, argsForApproval, item.FunctionCall)
+				// Stop processing here, wait for ApprovalResultMsg
+				return
+			}
+
+			// --- Execute Function Directly (No Approval Needed) ---
+			app.Logger.Log("Function %s does not require approval. Executing directly.", item.FunctionCall.Name)
+			app.ChatModel.SetThinkingStatus(fmt.Sprintf("Executing: %s...", item.FunctionCall.Name))
 			var agentOutput string
 			var success bool
 
@@ -420,7 +646,6 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) {
 				var args map[string]interface{}
 				cmdStr := ""
 				if err := json.Unmarshal([]byte(item.FunctionCall.Arguments), &args); err != nil {
-					app.Logger.Log("ERROR: Failed to unmarshal execute_command args: %v. Args: %s", err, item.FunctionCall.Arguments)
 					agentOutput = fmt.Sprintf("Error parsing command args: %v", err)
 					success = false
 					app.ChatModel.AddSystemMessage(agentOutput)
@@ -428,79 +653,90 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) {
 					var ok bool
 					cmdStr, ok = args["command"].(string)
 					if !ok || cmdStr == "" {
-						app.Logger.Log("ERROR: Missing or invalid 'command' argument in execute_command. Args: %+v", args)
 						agentOutput = "Missing command argument for execute_command"
 						success = false
 						app.ChatModel.AddSystemMessage(agentOutput)
 					} else {
-						app.Logger.Log("Executing command via sandbox: %s", cmdStr)
-						app.ChatModel.SetThinkingStatus(fmt.Sprintf("Executing: %s", cmdStr))
 						result, err := app.Sandbox.Execute(context.Background(), sandbox.SandboxOptions{
 							Command:    cmdStr,
 							WorkingDir: app.Config.CWD,
 							Timeout:    30 * time.Second,
 						})
-						app.Logger.Log("Sandbox execution result: ExitCode=%d, StdoutLen=%d, StderrLen=%d, Error=%v", result.ExitCode, len(result.Stdout), len(result.Stderr), err)
-
-						uiResult := &ui.CommandResult{
-							Command:  cmdStr,
-							Stdout:   result.Stdout,
-							Stderr:   result.Stderr,
-							ExitCode: result.ExitCode,
-							Duration: result.Duration,
-							Error:    err,
-						}
+						uiResult := &ui.CommandResult{Command: cmdStr, Stdout: result.Stdout, Stderr: result.Stderr, ExitCode: result.ExitCode, Duration: result.Duration, Error: err}
 						app.ChatModel.AddCommandMessage(cmdStr, uiResult)
-						app.ChatModel.ForceUpdateViewport()
-
 						agentOutput = result.Stdout
 						success = err == nil && result.ExitCode == 0
-						if !success {
-							if err != nil {
-								agentOutput = fmt.Sprintf("Execution Error: %v", err)
+						if !success { /* Set error output */
+						}
+					}
+				}
+			} else if item.FunctionCall.Name == "patch_file" {
+				var args map[string]interface{}
+				if err := json.Unmarshal([]byte(item.FunctionCall.Arguments), &args); err != nil {
+					agentOutput = fmt.Sprintf("Error parsing patch_file args: %v", err)
+					success = false
+					app.ChatModel.AddSystemMessage(agentOutput)
+				} else {
+					patchContent := ""
+					if pc, ok := args["code_edit"].(string); ok {
+						patchContent = pc
+					} else if pc, ok := args["patch_content"].(string); ok {
+						patchContent = pc
+					}
+					if patchContent == "" {
+						agentOutput = "Missing patch_content argument for patch_file"
+						success = false
+						app.ChatModel.AddSystemMessage(agentOutput)
+					} else {
+						operations, parseErr := fileops.ParseCustomPatch(patchContent)
+						if parseErr != nil {
+							agentOutput = fmt.Sprintf("Error parsing patch: %v", parseErr)
+							success = false
+							app.ChatModel.AddPatchResultMessage(&fileops.CustomPatchResult{Success: false, Error: parseErr, Operation: "parse_patch"})
+						} else {
+							applyResults, applyErr := fileops.ApplyCustomPatch(operations)
+							successCount, failureCount := 0, 0
+							for _, res := range applyResults {
+								if res.Success {
+									successCount++
+								} else {
+									failureCount++
+								}
+								app.ChatModel.AddPatchResultMessage(res)
+								app.ChatModel.ForceUpdateViewport()
+							}
+							if applyErr != nil {
+								agentOutput = fmt.Sprintf("Patch application finished with errors. Succeeded: %d, Failed: %d. First error: %v", successCount, failureCount, applyErr)
+								success = false
+							} else if failureCount > 0 {
+								agentOutput = fmt.Sprintf("Patch application finished. Succeeded: %d, Failed: %d.", successCount, failureCount)
+								success = false
 							} else {
-								agentOutput = fmt.Sprintf("Command Failed (code %d): %s", result.ExitCode, result.Stderr)
+								agentOutput = fmt.Sprintf("Patch application finished successfully. Operations applied: %d.", successCount)
+								success = true
 							}
 						}
 					}
 				}
-			} else {
+			} else { // Generic function from registry
 				fn := app.FunctionRegistry.Get(item.FunctionCall.Name)
-				if fn == nil {
+				if fn == nil { /* Handle unknown function */
 					agentOutput = fmt.Sprintf("Unknown function: %s", item.FunctionCall.Name)
 					success = false
-					app.Logger.Log("ERROR: %s", agentOutput)
 					app.ChatModel.AddSystemMessage(agentOutput)
 				} else {
-					app.Logger.Log("Executing registered function: %s", item.FunctionCall.Name)
 					result, err := fn(item.FunctionCall.Arguments)
-					app.Logger.Log("Function '%s' execution result: ResultLen=%d, Error=%v", item.FunctionCall.Name, len(result), err)
 					success = err == nil
 					agentOutput = result
-					if err != nil {
+					if err != nil { /* Set agentOutput, add system message */
 						agentOutput = fmt.Sprintf("Error: %v", err)
 						app.ChatModel.AddSystemMessage(agentOutput)
 					}
-
-					if item.FunctionCall.Name == "read_file" && success {
-						previewLen := 200
-						preview := result
-						if len(preview) > previewLen {
-							preview = preview[:previewLen] + "..."
-						}
-						app.ChatModel.AddSystemMessage(fmt.Sprintf("Read file content (preview): %s", preview))
-					}
-
 					app.ChatModel.AddFunctionResultMessage(agentOutput, !success)
-					app.ChatModel.ForceUpdateViewport()
 				}
 			}
 
-			app.isFirstAgentChunk = true
-
-			app.ChatModel.AddSystemMessage("Sending function results to assistant...")
-			app.ChatModel.ForceUpdateViewport()
-
+			// --- Send result back to agent --- (Only if approval wasn't needed)
 			resultMsg := sendFunctionResultMsg{
 				ctx:          context.Background(),
 				functionName: item.FunctionCall.Name,
@@ -510,11 +746,13 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) {
 				success:      success,
 			}
 
-			app.Logger.Log("App.handleAgentResponseItem: Starting goroutine to send sendFunctionResultMsg for %s (callID: %s).", resultMsg.functionName, resultMsg.callID)
+			app.Logger.Log("App.handleAgentResponseItem (Direct Execute): Starting goroutine to send sendFunctionResultMsg for %s.", resultMsg.functionName)
 			go func() {
+				time.Sleep(50 * time.Millisecond)
 				app.agentMsgChan <- resultMsg
-				app.Logger.Log("App.handleAgentResponseItem: Goroutine finished sending sendFunctionResultMsg.")
+				app.Logger.Log("App.handleAgentResponseItem (Direct Execute): Goroutine finished sending sendFunctionResultMsg.")
 			}()
+
 		} else {
 			app.Logger.Log("WARN: Handling 'function_call' item, but item.FunctionCall is nil.")
 		}
@@ -581,51 +819,37 @@ func (app *App) needsApprovalForFunction(functionName string) bool {
 	}
 }
 
-// askForApproval prompts the user for approval of a function call
-func (app *App) askForApproval(functionName, args string) (bool, string) {
-	app.Logger.Log("Asking for approval: Function=%s, Args=%q", functionName, args)
-	var operationType, title, description string
+// askForApproval sets the state to show the approval UI instead of blocking
+func (app *App) askForApproval(functionName, argsToDisplay string, originalCall *agent.FunctionCall) {
+	app.Logger.Log("Setting state to ask for approval: Function=%s, Args=%q", functionName, argsToDisplay)
+	var title, description string
 	switch functionName {
 	case "write_file":
-		operationType = "write to file"
 		title = "Approve File Write"
-		description = "The assistant wants to write to a file on your filesystem"
+		description = "The assistant wants to write to a file on your filesystem:"
 	case "patch_file":
-		operationType = "patch file"
 		title = "Approve File Patch"
-		description = "The assistant wants to modify a file on your filesystem"
+		description = "The assistant wants to modify a file using the following patch:"
 	case "execute_command":
-		operationType = "execute command"
 		title = "Approve Command Execution"
-		description = "The assistant wants to execute a shell command"
+		description = "The assistant wants to execute the following shell command:"
 	default:
-		operationType = "perform operation"
 		title = "Approve Operation"
-		description = "The assistant wants to perform an operation"
+		description = fmt.Sprintf("The assistant wants to perform the '%s' operation with arguments:", functionName)
 	}
 
-	app.ChatModel.AddSystemMessage(fmt.Sprintf("Waiting for approval to %s: %s", operationType, args))
-	app.ChatModel.ForceUpdateViewport() // Update UI to show prompt
+	app.approvalModel = ui.NewApprovalModel(title, description, argsToDisplay)
+	app.isAwaitingApproval = true
+	app.pendingFunctionCall = originalCall  // Store the original call details
+	app.pendingApprovalArgs = argsToDisplay // Store the args shown to the user
 
-	approved, err := ui.GetApproval(title, description, args)
-	if err != nil {
-		app.Logger.Log("Error during approval UI: %v", err)
-		app.ChatModel.AddSystemMessage(fmt.Sprintf("Error in approval process: %v", err))
-		return false, fmt.Sprintf("Error: %v", err)
-	}
+	// Update UI immediately to show the prompt
+	app.ChatModel.SetThinkingStatus(fmt.Sprintf("Awaiting approval for %s...", functionName))
+	// No need to add system message here, the approval UI itself is the message
+	app.ChatModel.ForceUpdateViewport() // Force update might be needed if View logic depends on state
 
-	var message string
-	if approved {
-		message = "Operation approved by user"
-		app.Logger.Log("Operation APPROVED by user.")
-	} else {
-		message = "Operation denied by user"
-		app.Logger.Log("Operation DENIED by user.")
-	}
-
-	app.ChatModel.AddSystemMessage(message)
-	app.ChatModel.ForceUpdateViewport()
-	return approved, message
+	// We don't return anything or block here
+	app.Logger.Log("Approval state set. Waiting for ui.ApprovalResultMsg.")
 }
 
 // initRepositoryContext loads project-specific context from codex.md files

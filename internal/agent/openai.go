@@ -31,17 +31,19 @@ type FunctionDef struct {
 
 // OpenAIAgent implements the Agent interface using OpenAI
 type OpenAIAgent struct {
-	client         *openai.Client
-	config         *config.Config
-	tools          []ToolDefinition
-	currentContext context.Context
-	cancelFunc     context.CancelFunc
-	sessionID      string
-	history        *ConversationHistory
-	historyOpts    HistoryOptions
-	mu             sync.Mutex
-	currentHandler ResponseHandler
-	logger         logging.Logger
+	client           *openai.Client
+	config           *config.Config
+	tools            []ToolDefinition
+	currentContext   context.Context
+	cancelFunc       context.CancelFunc
+	sessionID        string
+	history          *ConversationHistory
+	historyOpts      HistoryOptions
+	mu               sync.Mutex
+	currentHandler   ResponseHandler
+	pendingToolCalls map[string]bool // Map of CallID -> true (pending)
+	pendingMu        sync.Mutex      // Mutex for pendingToolCalls map
+	logger           logging.Logger
 }
 
 // NewOpenAIAgent creates a new OpenAI agent
@@ -158,13 +160,14 @@ func NewOpenAIAgent(cfg *config.Config, logger logging.Logger) (*OpenAIAgent, er
 
 	// Create agent
 	agent := &OpenAIAgent{
-		client:      client,
-		config:      cfg,
-		tools:       tools,
-		sessionID:   sessionID,
-		history:     history,
-		historyOpts: historyOpts,
-		logger:      logger,
+		client:           client,
+		config:           cfg,
+		tools:            tools,
+		sessionID:        sessionID,
+		history:          history,
+		historyOpts:      historyOpts,
+		logger:           logger,
+		pendingToolCalls: make(map[string]bool), // Initialize the map
 	}
 
 	return agent, nil
@@ -176,6 +179,7 @@ func (a *OpenAIAgent) SendMessage(ctx context.Context, messages []Message, handl
 	a.mu.Lock()
 	// Cancel any ongoing request
 	if a.cancelFunc != nil {
+		a.logger.Log("[DEBUG] Agent.SendMessage: Cancelling previous context/request.")
 		a.cancelFunc()
 	}
 
@@ -184,10 +188,40 @@ func (a *OpenAIAgent) SendMessage(ctx context.Context, messages []Message, handl
 
 	// Create a new context with cancellation
 	a.currentContext, a.cancelFunc = context.WithCancel(ctx)
-	a.mu.Unlock()
+	a.mu.Unlock() // Unlock main mutex early
 
-	// Add new messages to history (user input)
-	a.history.AddMessages(messages)
+	// --- BEGIN CANCELLATION HANDLING ---
+	var abortedToolResults []Message
+	a.pendingMu.Lock()
+	if len(a.pendingToolCalls) > 0 {
+		a.logger.Log("[INFO] Agent.SendMessage: Found %d pending tool calls from previous cancelled interaction.", len(a.pendingToolCalls))
+		for callID := range a.pendingToolCalls {
+			abortedResultContent := map[string]interface{}{"error": "execution cancelled by user"}
+			// We might not know the function name here, but ToolCallID is the important part
+			abortedToolResults = append(abortedToolResults, Message{
+				Role:       openai.ChatMessageRoleTool,
+				Content:    string(mustMarshal(abortedResultContent)),
+				ToolCallID: callID,
+				// Name:       "unknown_cancelled_function", // Or leave empty
+			})
+			a.logger.Log("[DEBUG] Agent.SendMessage: Created aborted result for CallID %s", callID)
+		}
+		// Clear the pending map after processing
+		a.pendingToolCalls = make(map[string]bool)
+		a.logger.Log("[DEBUG] Agent.SendMessage: Cleared pendingToolCalls map.")
+	}
+	a.pendingMu.Unlock()
+
+	// Add the aborted results AND the new user messages to history
+	if len(abortedToolResults) > 0 {
+		a.history.AddMessages(abortedToolResults) // Add aborted results first
+		a.logger.Log("[DEBUG] Agent.SendMessage: Added %d aborted tool results to history.", len(abortedToolResults))
+	}
+	if len(messages) > 0 {
+		a.history.AddMessages(messages) // Then add the new user message(s)
+		a.logger.Log("[DEBUG] Agent.SendMessage: Added %d new message(s) from user to history.", len(messages))
+	}
+	// --- END CANCELLATION HANDLING ---
 
 	// Get context-aware messages from history
 	historyMessages := a.history.GetMessagesForContext()
@@ -366,6 +400,17 @@ func (a *OpenAIAgent) SendMessage(ctx context.Context, messages []Message, handl
 							ID:        id, // Use the map key as the ID
 						}
 
+						// --- BEGIN Track Pending Tool Calls ---
+						a.pendingMu.Lock()
+						// Ensure map is initialized (redundant if done in constructor, but safe)
+						if a.pendingToolCalls == nil {
+							a.pendingToolCalls = make(map[string]bool)
+						}
+						a.pendingToolCalls[id] = true
+						a.logger.Log("[DEBUG] Agent.SendMessage: Added CallID %s to pendingToolCalls", id)
+						a.pendingMu.Unlock()
+						// --- END Track Pending Tool Calls ---
+
 						a.logger.Log("[DEBUG] Agent.SendMessage: Calling handler with type 'function_call'. Name: %s, Args: '%s', ID: %s", functionCall.Name, functionCall.Arguments, functionCall.ID)
 						// Create the item
 						itemToSend := ResponseItem{
@@ -431,13 +476,22 @@ func (a *OpenAIAgent) GetCommandConfirmation(ctx context.Context, command string
 	}, nil
 }
 
-// Cancel cancels the current streaming response
+// Cancel cancels the current streaming response and marks pending tool calls for abort handling.
 func (a *OpenAIAgent) Cancel() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.mu.Lock() // Lock main mutex for cancelFunc
 	if a.cancelFunc != nil {
+		a.logger.Log("[DEBUG] Agent.Cancel: Calling context cancelFunc().")
 		a.cancelFunc()
+		a.cancelFunc = nil // Prevent repeated calls
+	} else {
+		a.logger.Log("[DEBUG] Agent.Cancel: No active context cancelFunc to call.")
 	}
+	a.mu.Unlock()
+
+	// Note: We don't clear pendingToolCalls here. The map now correctly represents
+	// calls that were issued but whose results were not processed before cancellation.
+	// The SendMessage function will handle clearing them on the *next* interaction.
+	a.logger.Log("[DEBUG] Agent.Cancel: Cancellation requested. Pending tool calls will be handled on next SendMessage.")
 }
 
 // Close closes the agent and releases any resources
@@ -477,12 +531,17 @@ func (a *OpenAIAgent) SendFunctionResult(ctx context.Context, callID, functionNa
 
 	a.logger.Log("[DEBUG] Agent.SendFunctionResult: Received result for CallID: %s, Name: %s, Success: %t", callID, functionName, success)
 
-	// Ensure handler is cleared eventually, though SendMessage already has a defer
-	// defer func() {
-	// 	a.mu.Lock()
-	// 	a.currentHandler = nil
-	// 	a.mu.Unlock()
-	// }()
+	// --- BEGIN Remove from Pending Tool Calls ---
+	a.pendingMu.Lock()
+	if _, exists := a.pendingToolCalls[callID]; exists {
+		delete(a.pendingToolCalls, callID)
+		a.logger.Log("[DEBUG] Agent.SendFunctionResult: Removed CallID %s from pendingToolCalls", callID)
+	} else {
+		// This might happen if SendFunctionResult is called unexpectedly or after a cancellation was already processed.
+		a.logger.Log("[WARN] Agent.SendFunctionResult: CallID %s not found in pendingToolCalls when trying to remove.", callID)
+	}
+	a.pendingMu.Unlock()
+	// --- END Remove from Pending Tool Calls ---
 
 	// 1. Create the tool result message to add to history
 	var content map[string]interface{}

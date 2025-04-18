@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/epuerta/codex-go/internal/agent"
+	"github.com/epuerta/codex-go/internal/fileops"
 	"github.com/epuerta/codex-go/internal/logging"
 	"github.com/google/uuid"
 )
@@ -78,6 +79,16 @@ var (
 
 	commandOutputStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("5")).
+				PaddingLeft(1)
+
+	patchSuccessStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("2")). // Green
+				Bold(true).
+				PaddingLeft(1)
+
+	patchFailureStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("1")). // Red
+				Bold(true).
 				PaddingLeft(1)
 )
 
@@ -288,6 +299,37 @@ func (m *ChatModel) AddFunctionResultMessage(result string, isError bool) {
 		Content:   result,
 		Timestamp: time.Now(),
 		ANSI:      strings.Contains(result, "\x1b["), // Check for ANSI escape codes
+	})
+}
+
+// AddPatchResultMessage adds a formatted patch result message to the local messages
+func (m *ChatModel) AddPatchResultMessage(result *fileops.CustomPatchResult) {
+	var content string
+
+	if result.Success {
+		prefix := "[✓ Patch Applied]"
+		content = fmt.Sprintf("%s Op: %s, Path: %s, Lines: %d -> %d",
+			prefix,
+			result.Operation,
+			result.Path,
+			result.OriginalLines,
+			result.NewLines,
+		)
+	} else {
+		prefix := "[✗ Patch Failed] "
+		content = fmt.Sprintf("%s Op: %s, Path: %s, Error: %v",
+			prefix,
+			result.Operation,
+			result.Path,
+			result.Error,
+		)
+	}
+
+	m.AddMessage(Message{
+		Role:      "patch_result", // Use a specific role
+		Content:   content,
+		Timestamp: time.Now(),
+		// Use the calculated style for this specific message type (handled in formatMessage)
 	})
 }
 
@@ -516,6 +558,15 @@ func formatMessage(msg Message, width int, showTimestamp bool) string {
 		prefix = "tool.result"
 		style = commandOutputStyle // Reuse style for now
 		renderedContent = wordWrap(msg.Content, width-len(prefix)-2)
+	case "patch_result": // Handle the new message role
+		// Determine style based on success prefix
+		if strings.HasPrefix(msg.Content, "[✓ Patch Applied]") {
+			style = patchSuccessStyle
+		} else {
+			style = patchFailureStyle
+		}
+		prefix = "" // Prefix is already part of the content
+		renderedContent = wordWrap(msg.Content, width-2)
 
 	default:
 		prefix = msg.Role
