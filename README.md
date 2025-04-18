@@ -24,11 +24,14 @@ It's implemented in Go with a focus on performance, security, and extensibility.
 
 ```bash
 # Clone the repository
-git clone https://github.com/epuerta/codex-go.git
+git clone https://github.com/epuerta9/codex-go.git
 cd codex-go
 
 # Build the binary
-go build -o codex cmd/codex/main.go
+go build -o codex ./cmd/codex
+
+# Make executable
+chmod +x codex
 
 # Move to a location in your PATH (optional)
 sudo mv codex /usr/local/bin/
