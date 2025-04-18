@@ -52,6 +52,11 @@ var (
 				Border(lipgloss.DoubleBorder()).
 				BorderForeground(lipgloss.Color("6")). // Cyan
 				Padding(1)
+
+	// Styles for Diff View
+	diffAddedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))  // Green
+	diffRemovedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))   // Red
+	diffContextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244")) // Gray (for unchanged lines/context)
 )
 
 // Key bindings
@@ -162,8 +167,7 @@ func (m *ApprovalModel) SetSize(termWidth, termHeight int) {
 		m.ready = true // Mark as ready once we have dimensions
 	}
 
-	// --- Calculate Dialog Box Size ---
-	// Use a percentage of terminal width, with min/max constraints
+	// --- Calculate Dialog Box Width ---
 	desiredDialogWidth := int(float64(termWidth) * 0.8)
 	minDialogWidth := 40
 	maxDialogWidth := 120
@@ -174,9 +178,8 @@ func (m *ApprovalModel) SetSize(termWidth, termHeight int) {
 	if dialogW > maxDialogWidth {
 		dialogW = maxDialogWidth
 	}
-	// Ensure dialog fits within terminal width
-	if dialogW > termWidth {
-		dialogW = termWidth
+	if dialogW > termWidth-2 { // Ensure fits with padding
+		dialogW = termWidth - 2
 	}
 	m.dialogWidth = dialogW
 
@@ -189,15 +192,14 @@ func (m *ApprovalModel) SetSize(termWidth, termHeight int) {
 	m.viewport.Width = vpWidth
 
 	// --- Wrap Content for Height Calculation ---
-	// Wrap action content first, as it's the main variable height element
 	wrappedAction := lipgloss.NewStyle().Width(m.viewport.Width).Render(m.Action)
-	m.viewport.SetContent(wrappedAction) // Set content now, viewport will handle scrolling internally
+	m.viewport.SetContent(wrappedAction)
 
 	// --- Calculate Non-Viewport Height ---
-	titleView := m.renderTitle(vpWidth)      // Render with final vpWidth
-	descView := m.renderDescription(vpWidth) // Render with final vpWidth
-	buttonsView := m.renderButtons()         // Buttons have fixed height
-	helpView := m.renderHelp(vpWidth)        // Render help with final vpWidth
+	titleView := m.renderTitle(vpWidth)
+	descView := m.renderDescription(vpWidth)
+	buttonsView := m.renderButtons()
+	helpView := m.renderHelp(vpWidth)
 	nonViewportHeight := lipgloss.Height(titleView) +
 		lipgloss.Height(descView) +
 		lipgloss.Height(buttonsView) +
@@ -209,33 +211,47 @@ func (m *ApprovalModel) SetSize(termWidth, termHeight int) {
 		approvalButtonStyle.GetVerticalMargins()*2 + // Button row margins
 		approvalHelpStyle.GetVerticalMargins()
 
-	// --- Calculate Viewport Height ---
-	// Start with available terminal height minus some buffer
-	availableHeight := termHeight - 4 // Buffer space top/bottom
-	// Subtract non-content height
-	vpHeight := availableHeight - nonViewportHeight
-	minViewportHeight := 3
-	if vpHeight < minViewportHeight {
-		vpHeight = minViewportHeight
+	// --- Calculate Viewport and Dialog Height ---
+	// Available height within terminal for the dialog content itself
+	maxAvailableHeight := termHeight - approvalDialogStyle.GetVerticalPadding() - 2 // Subtract dialog padding and small buffer
+	if maxAvailableHeight < 0 {
+		maxAvailableHeight = 0
 	}
-	m.viewport.Height = vpHeight
 
-	// --- Calculate Final Dialog Height ---
-	// Based on the content it needs to hold
+	// Calculate ideal viewport height based on available space
+	idealVpHeight := maxAvailableHeight - nonViewportHeight
+
+	// Apply constraints: min, max, and available space
+	minViewportHeight := 3
+	maxViewportHeight := 15 // << The requested limit
+
+	finalVpHeight := idealVpHeight // Start with ideal
+	if finalVpHeight < minViewportHeight {
+		finalVpHeight = minViewportHeight
+	}
+	if finalVpHeight > maxViewportHeight {
+		finalVpHeight = maxViewportHeight
+	}
+
+	m.viewport.Height = finalVpHeight
+
+	// Calculate final dialog height based on the *constrained* viewport height
 	m.dialogHeight = nonViewportHeight + m.viewport.Height
-	// Ensure dialog fits within terminal height
-	if m.dialogHeight > availableHeight {
-		m.dialogHeight = availableHeight
-		// If dialog height is capped, recalculate viewport height
+
+	// Ensure final dialog height still fits within the absolute max available height
+	if m.dialogHeight > maxAvailableHeight {
+		m.dialogHeight = maxAvailableHeight
+		// If we capped the dialog height, we might need to shrink the viewport *again*
+		// This edge case happens if nonViewportHeight is very large
 		newVpHeight := m.dialogHeight - nonViewportHeight
-		if newVpHeight < minViewportHeight {
+		if newVpHeight < minViewportHeight { // Ensure min is still respected
 			newVpHeight = minViewportHeight
 		}
 		m.viewport.Height = newVpHeight
 	}
 
-	// Ensure viewport has content set *after* dimensions are final
-	m.viewport.SetContent(wrappedAction) // Re-set content just in case
+	// Ensure viewport content is set after final dimensions
+	m.viewport.SetContent(wrappedAction)
 }
 
 // renderTitle renders the title, wrapped to width

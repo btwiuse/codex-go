@@ -303,6 +303,7 @@ func (m *ChatModel) AddFunctionResultMessage(result string, isError bool) {
 }
 
 // AddPatchResultMessage adds a formatted patch result message to the local messages
+// This handles the CustomPatchResult type.
 func (m *ChatModel) AddPatchResultMessage(result *fileops.CustomPatchResult) {
 	var content string
 
@@ -330,6 +331,52 @@ func (m *ChatModel) AddPatchResultMessage(result *fileops.CustomPatchResult) {
 		Content:   content,
 		Timestamp: time.Now(),
 		// Use the calculated style for this specific message type (handled in formatMessage)
+	})
+}
+
+// AddAgentPatchResultMessage adds a formatted agent patch result message to the local messages.
+// This handles the AgentPatchResult type.
+func (m *ChatModel) AddAgentPatchResultMessage(result *fileops.AgentPatchResult) {
+	var content string
+
+	if result.Success {
+		prefix := "[✓ Patch Applied]"
+		// Use the Diff field which contains a summary like "X operations applied."
+		// or "No changes applied."
+		content = fmt.Sprintf("%s Path: %s (%s, Lines: %d -> %d)",
+			prefix,
+			result.Path,
+			strings.TrimSuffix(result.Diff, "."), // Trim period for conciseness
+			result.OriginalLines,
+			result.NewLines,
+		)
+	} else {
+		prefix := "[✗ Patch Failed] "
+		errorStr := "Unknown error"
+		if result.Error != nil {
+			errorStr = result.Error.Error()
+		}
+		// Include the Diff field if it provides extra info (like parsing failed)
+		if result.Diff != "" && !strings.Contains(errorStr, result.Diff) {
+			content = fmt.Sprintf("%s Path: %s (%s), Error: %s",
+				prefix,
+				result.Path,
+				result.Diff,
+				errorStr,
+			)
+		} else {
+			content = fmt.Sprintf("%s Path: %s, Error: %s",
+				prefix,
+				result.Path,
+				errorStr,
+			)
+		}
+	}
+
+	m.AddMessage(Message{
+		Role:      "patch_result", // Use the same role for styling
+		Content:   content,
+		Timestamp: time.Now(),
 	})
 }
 

@@ -15,6 +15,7 @@ log.txt
 # Test binary, built with `go test -c`
 *.test
 cloudpilot-ee/
+latest.log
 
 # Output of the go coverage tool
 *.out

@@ -10,6 +10,210 @@ import (
 	"strings"
 )
 
+// AgentPatchOperation represents a single operation derived from the custom agent format
+type AgentPatchOperation struct {
+	Type    string // "add" or "remove"
+	Path    string // Path to the file
+	Content string // Content to add or remove (without ADD:/DEL: prefix)
+	// Note: Line numbers are not directly available in this format
+}
+
+// ParseAgentPatch parses the agent's specific patch format.
+// It looks for // FILE:, // EDIT:, // END_EDIT, ADD:, and DEL: markers.
+func ParseAgentPatch(patchContent string) ([]AgentPatchOperation, error) {
+	var operations []AgentPatchOperation
+	lines := strings.Split(patchContent, "\n")
+
+	currentFile := ""
+	inEditBlock := false
+	var fileParseError error
+
+	for _, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+
+		if strings.HasPrefix(trimmedLine, "// FILE:") {
+			currentFile = strings.TrimSpace(strings.TrimPrefix(trimmedLine, "// FILE:"))
+			if currentFile == "" {
+				fileParseError = fmt.Errorf("found '// FILE:' marker with no filename")
+			}
+			inEditBlock = false
+			continue
+		}
+
+		if strings.HasPrefix(trimmedLine, "// EDIT:") {
+			if currentFile == "" {
+				fileParseError = fmt.Errorf("found '// EDIT:' marker before '// FILE:' marker")
+			}
+			inEditBlock = true
+			continue
+		}
+
+		if strings.HasPrefix(trimmedLine, "// END_EDIT") {
+			inEditBlock = false
+			continue
+		}
+
+		if inEditBlock && currentFile != "" {
+			if strings.HasPrefix(line, "ADD:") {
+				content := strings.TrimPrefix(line, "ADD:")
+				// Remove potential leading space after prefix
+				content = strings.TrimPrefix(content, " ")
+				operations = append(operations, AgentPatchOperation{
+					Type:    "add",
+					Path:    currentFile,
+					Content: content,
+				})
+			} else if strings.HasPrefix(line, "DEL:") {
+				content := strings.TrimPrefix(line, "DEL:")
+				// Remove potential leading space after prefix
+				content = strings.TrimPrefix(content, " ")
+				operations = append(operations, AgentPatchOperation{
+					Type:    "remove",
+					Path:    currentFile,
+					Content: content,
+				})
+			}
+		}
+	}
+
+	return operations, fileParseError
+}
+
+// ApplyAgentPatch applies a series of custom agent patch operations.
+// This version attempts to remove lines based on content match (ignoring leading/trailing space)
+// and appends added lines.
+func ApplyAgentPatch(operations []AgentPatchOperation) ([]*AgentPatchResult, error) {
+	var results []*AgentPatchResult
+	var overallError error
+	opsByFile := make(map[string][]AgentPatchOperation)
+	for _, op := range operations {
+		opsByFile[op.Path] = append(opsByFile[op.Path], op)
+	}
+
+	for path, ops := range opsByFile {
+		result := &AgentPatchResult{Path: path, Success: false} // Default to failure
+		results = append(results, result)
+
+		// ----------------- Start Revised Logic -----------------
+
+		// 1. Collect lines to delete and lines to add
+		linesToDelete := make(map[string]bool)
+		var linesToAdd []string
+		deleteOpCount := 0 // Keep track of DEL operations for reporting
+		addOpCount := 0
+		for _, op := range ops {
+			if op.Type == "remove" {
+				// Split multi-line content into individual lines for deletion map
+				for _, lineToDelete := range strings.Split(op.Content, "\n") {
+					trimmedLine := strings.TrimSpace(lineToDelete)
+					if trimmedLine != "" { // Avoid adding empty lines from blank DEL blocks
+						linesToDelete[trimmedLine] = true
+					}
+				}
+				deleteOpCount++
+			} else if op.Type == "add" {
+				linesToAdd = append(linesToAdd, op.Content)
+				addOpCount++
+			}
+		}
+
+		// 2. Read original file (handle potential creation)
+		contentBytes, readErr := ioutil.ReadFile(path)
+		isNotExist := os.IsNotExist(readErr)
+
+		if readErr != nil && !isNotExist {
+			result.Error = fmt.Errorf("failed to read file %s: %w", path, readErr)
+			if overallError == nil {
+				overallError = result.Error
+			}
+			continue // Skip to next file
+		}
+
+		// Check if we should create the file
+		shouldCreate := isNotExist && addOpCount > 0
+		if isNotExist && !shouldCreate {
+			// File doesn't exist, and we aren't adding anything, so it's an error if trying to delete
+			if deleteOpCount > 0 {
+				result.Error = fmt.Errorf("file %s does not exist and cannot apply deletions", path)
+				if overallError == nil {
+					overallError = result.Error
+				}
+			} else {
+				// No error, but nothing to do
+				result.Success = true
+				result.Diff = "File does not exist, no operation performed."
+			}
+			continue // Skip to next file
+		}
+
+		var originalLines []string
+		if !isNotExist {
+			originalLines = strings.Split(string(contentBytes), "\n")
+		}
+		result.OriginalLines = len(originalLines)
+
+		// 3. Build new content excluding deleted lines
+		modifiedLines := make([]string, 0, len(originalLines))
+		actualDeletions := 0
+		for _, line := range originalLines {
+			if !linesToDelete[strings.TrimSpace(line)] {
+				modifiedLines = append(modifiedLines, line) // Keep the original line
+			} else {
+				actualDeletions++
+			}
+		}
+
+		// 4. Append added lines
+		modifiedLines = append(modifiedLines, linesToAdd...)
+
+		// 5. Check if changes were actually made
+		linesWereModified := (actualDeletions > 0) || (addOpCount > 0) || shouldCreate
+
+		if linesWereModified {
+			newContent := strings.Join(modifiedLines, "\n")
+			// Ensure directory exists if creating file
+			if shouldCreate {
+				dir := filepath.Dir(path)
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					result.Error = fmt.Errorf("failed to create directory for %s: %w", path, err)
+					if overallError == nil {
+						overallError = result.Error
+					}
+					continue // Skip to next file
+				}
+			}
+			// Write the file
+			if err := ioutil.WriteFile(path, []byte(newContent), 0644); err != nil {
+				result.Error = fmt.Errorf("failed to write changes to file %s: %w", path, err)
+				if overallError == nil {
+					overallError = result.Error
+				}
+				continue // Skip to next file
+			}
+			result.Success = true
+			result.NewLines = len(modifiedLines)
+			result.Diff = fmt.Sprintf("Applied +%d/-%d lines.", addOpCount, actualDeletions)
+		} else {
+			result.Success = true
+			result.Diff = "No effective changes applied."
+			result.NewLines = len(originalLines)
+		}
+		// ----------------- End Revised Logic -----------------
+	}
+
+	return results, overallError
+}
+
+// Helper to check if any operation implies file creation for the agent patch format
+func shouldCreateFileForAgentPatch(ops []AgentPatchOperation) bool {
+	for _, op := range ops {
+		if op.Type == "add" {
+			return true
+		}
+	}
+	return false
+}
+
 // PatchOperation represents a single patch operation
 type PatchOperation struct {
 	Type      string // "add", "remove", "replace"
@@ -327,4 +531,14 @@ func atoi(s string) int {
 	var n int
 	fmt.Sscanf(s, "%d", &n)
 	return n
+}
+
+// AgentPatchResult represents the result of applying an agent patch operation
+type AgentPatchResult struct {
+	Success       bool
+	Error         error
+	Path          string
+	OriginalLines int
+	NewLines      int
+	Diff          string // Represents outcome description
 }

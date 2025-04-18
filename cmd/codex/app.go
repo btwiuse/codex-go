@@ -232,43 +232,66 @@ func (app *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					patchContent := app.pendingApprovalArgs
 					app.Logger.Log("Executing approved patch. Content length: %d", len(patchContent))
 					app.ChatModel.SetThinkingStatus("Applying patch...")
-					app.Logger.Log("Calling fileops.ParseCustomPatch...")
-					operations, parseErr := fileops.ParseCustomPatch(patchContent)
+					app.Logger.Log("Calling fileops.ParseAgentPatch...")
+					operations, parseErr := fileops.ParseAgentPatch(patchContent)
 					if parseErr != nil {
-						app.Logger.Log("ERROR: Failed to parse custom patch: %v", parseErr)
+						app.Logger.Log("ERROR: Failed to parse agent patch: %v", parseErr)
 						agentOutput = fmt.Sprintf("Error parsing patch: %v", parseErr)
 						success = false
-						patchResMsg := &fileops.CustomPatchResult{Success: false, Error: parseErr, Operation: "parse_patch"}
+						patchResMsg := &fileops.AgentPatchResult{
+							Success: false,
+							Error:   parseErr,
+							Diff:    "Patch parsing failed",
+						}
 						app.Logger.Log("Adding patch parse error message to UI: %+v", *patchResMsg)
-						app.ChatModel.AddPatchResultMessage(patchResMsg)
+						app.ChatModel.AddAgentPatchResultMessage(patchResMsg)
 						app.Logger.Log("Calling ForceUpdateViewport after adding parse error.")
 						app.ChatModel.ForceUpdateViewport()
 						app.Logger.Log("ForceUpdateViewport completed after adding parse error.")
 					} else {
-						app.Logger.Log("Parsed %d operations from patch. Calling fileops.ApplyCustomPatch...", len(operations))
-						applyResults, applyErr := fileops.ApplyCustomPatch(operations)
-						app.Logger.Log("ApplyCustomPatch finished. Results count: %d, Overall error: %v", len(applyResults), applyErr)
+						app.Logger.Log("Parsed %d operations from patch. Calling fileops.ApplyAgentPatch...", len(operations))
+						applyResults, applyErr := fileops.ApplyAgentPatch(operations)
+						app.Logger.Log("ApplyAgentPatch finished. Results count: %d, Overall error: %v", len(applyResults), applyErr)
 
 						successCount, failureCount := 0, 0
-						// Log chat messages state before adding results (Removed GetMessageCount call)
 						app.Logger.Log("Adding patch results to UI...")
 						for i, res := range applyResults {
-							app.Logger.Log("Processing applyResult %d: Success=%t, Path=%s, Op=%s, Error=%v", i+1, res.Success, res.Path, res.Operation, res.Error)
+							app.Logger.Log("Processing applyResult %d: Success=%t, Path=%s, Diff=%s, Error=%v", i+1, res.Success, res.Path, res.Diff, res.Error)
 							if res.Success {
 								successCount++
+								// --- Start: Auto-format successful patch ---
+								formatCmdStr := getFormatterCommand(res.Path)
+								if formatCmdStr != "" {
+									app.Logger.Log("Attempting to auto-format successfully patched file: %s with command: %s", res.Path, formatCmdStr)
+									formatCtx, formatCancel := context.WithTimeout(context.Background(), 15*time.Second)
+									formatResult, formatErr := app.Sandbox.Execute(formatCtx, sandbox.SandboxOptions{
+										Command:    formatCmdStr,
+										WorkingDir: app.Config.CWD,
+									})
+									formatCancel()
+									if formatErr != nil || formatResult.ExitCode != 0 {
+										formatErrMsg := fmt.Sprintf("Auto-formatting failed for %s.", res.Path)
+										if formatErr != nil {
+											formatErrMsg = fmt.Sprintf("%s Error: %v", formatErrMsg, formatErr)
+										} else {
+											formatErrMsg = fmt.Sprintf("%s Exit Code: %d, Stderr: %s", formatErrMsg, formatResult.ExitCode, formatResult.Stderr)
+										}
+										app.Logger.Log("ERROR: %s", formatErrMsg)
+										app.ChatModel.AddSystemMessage(formatErrMsg)
+									} else {
+										app.Logger.Log("Successfully auto-formatted %s.", res.Path)
+									}
+								} else {
+									app.Logger.Log("No formatter identified for file extension of %s, skipping auto-format.", res.Path)
+								}
+								// --- End: Auto-format successful patch ---
 							} else {
 								failureCount++
 							}
-							// Log before adding
-							app.Logger.Log("Adding patch result message %d to UI: %+v", i+1, *res)
-							app.ChatModel.AddPatchResultMessage(res)
-							// Log before forcing update
-							app.Logger.Log("Calling ForceUpdateViewport after adding result %d.", i+1)
+							app.ChatModel.AddAgentPatchResultMessage(res)
 							app.ChatModel.ForceUpdateViewport()
-							app.Logger.Log("ForceUpdateViewport completed for result %d.", i+1)
 						}
 						app.Logger.Log("Finished adding %d patch result messages to ChatModel.", len(applyResults))
-						// Log chat messages state after adding results (Removed GetMessageCount call)
 						app.Logger.Log("Finished processing patch apply results.")
 
 						if applyErr != nil {
@@ -602,7 +625,7 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) {
 			app.ChatModel.AddFunctionCallMessage(item.FunctionCall.Name, item.FunctionCall.Arguments)
 			app.ChatModel.ForceUpdateViewport()
 
-			// --- Decide if Approval Needed --- Moved earlier
+			// --- Decide if Approval Needed ---
 			needsApproval := app.needsApprovalForFunction(item.FunctionCall.Name)
 			var argsForApproval string
 			if needsApproval {
@@ -613,24 +636,44 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) {
 							argsForApproval = cmd
 						} else if patch, ok := argsMap["code_edit"].(string); ok {
 							argsForApproval = patch
-						} else if patch, ok := argsMap["patch_content"].(string); ok {
+						} else if patch, ok := argsMap["patch_content"].(string); ok { // Handle alternative key
 							argsForApproval = patch
-						} else if content, ok := argsMap["content"].(string); ok {
+						} else if content, ok := argsMap["content"].(string); ok { // For write_file
 							argsForApproval = content
 						} else {
 							argsForApproval = item.FunctionCall.Arguments
+							app.Logger.Log("WARN: Could not extract specific arg (command/code_edit/patch_content/content) for approval display from: %s", item.FunctionCall.Arguments)
 						}
 					} else {
 						argsForApproval = item.FunctionCall.Arguments
+						app.Logger.Log("WARN: Failed to unmarshal args JSON for approval display: %s", item.FunctionCall.Arguments)
 					}
 				} else {
-					argsForApproval = item.FunctionCall.Arguments
+					argsForApproval = item.FunctionCall.Arguments // For other functions, just show the JSON args
 				}
 			}
-			app.Logger.Log("Determined argsForApproval: %s", argsForApproval)
+			app.Logger.Log("Determined argsForApproval length: %d", len(argsForApproval))
 
 			if needsApproval {
-				app.Logger.Log("Function %s requires approval. Triggering approval state.", item.FunctionCall.Name)
+				app.Logger.Log("Function %s requires approval.", item.FunctionCall.Name)
+
+				// --- Add Summary Message to Chat (if patch_file) ---
+				if item.FunctionCall.Name == "patch_file" {
+					// Extract target files from the patch content for the summary
+					targetFiles := extractTargetFilesFromPatch(argsForApproval)
+					summary := ""
+					if len(targetFiles) > 0 {
+						summary = fmt.Sprintf("Assistant proposes patching file(s): %s. Approval required.", strings.Join(targetFiles, ", "))
+					} else {
+						summary = "Assistant proposes applying a patch. Approval required."
+					}
+					app.Logger.Log("Adding patch proposal summary to chat: %s", summary)
+					app.ChatModel.AddSystemMessage(summary)
+					app.ChatModel.ForceUpdateViewport() // Update view to show the summary
+				}
+				// ----------------------------------------------------
+
+				// Trigger the approval UI
 				app.askForApproval(item.FunctionCall.Name, argsForApproval, item.FunctionCall)
 				// Stop processing here, wait for ApprovalResultMsg
 				return
@@ -667,6 +710,11 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) {
 						agentOutput = result.Stdout
 						success = err == nil && result.ExitCode == 0
 						if !success { /* Set error output */
+							if err != nil {
+								agentOutput = fmt.Sprintf("Execution Error: %v", err)
+							} else {
+								agentOutput = fmt.Sprintf("Command Failed (code %d): %s", result.ExitCode, result.Stderr)
+							}
 						}
 					}
 				}
@@ -688,21 +736,62 @@ func (app *App) handleAgentResponseItem(item agent.ResponseItem) {
 						success = false
 						app.ChatModel.AddSystemMessage(agentOutput)
 					} else {
-						operations, parseErr := fileops.ParseCustomPatch(patchContent)
+						// --- Approval Check ---
+						if app.needsApprovalForFunction(item.FunctionCall.Name) {
+							app.askForApproval(item.FunctionCall.Name, patchContent, item.FunctionCall)
+							// If approval is needed, we stop processing here and wait for ApprovalResultMsg
+							app.Logger.Log("Approval required for patch_file. Skipping direct execution.")
+							return // Don't proceed to execution or sending result yet
+						}
+						// --- Direct Execution (if no approval needed) ---
+						app.Logger.Log("Calling fileops.ParseAgentPatch directly...")
+						operations, parseErr := fileops.ParseAgentPatch(patchContent)
 						if parseErr != nil {
 							agentOutput = fmt.Sprintf("Error parsing patch: %v", parseErr)
 							success = false
-							app.ChatModel.AddPatchResultMessage(&fileops.CustomPatchResult{Success: false, Error: parseErr, Operation: "parse_patch"})
+							// Add parse error result to UI
+							app.ChatModel.AddAgentPatchResultMessage(&fileops.AgentPatchResult{
+								Success: false,
+								Error:   parseErr,
+								Diff:    "Patch parsing failed",
+							})
 						} else {
-							applyResults, applyErr := fileops.ApplyCustomPatch(operations)
+							app.Logger.Log("Calling fileops.ApplyAgentPatch directly...")
+							applyResults, applyErr := fileops.ApplyAgentPatch(operations)
 							successCount, failureCount := 0, 0
 							for _, res := range applyResults {
 								if res.Success {
 									successCount++
+									// --- Start: Auto-format successful patch ---
+									formatCmdStr := getFormatterCommand(res.Path)
+									if formatCmdStr != "" {
+										app.Logger.Log("[Direct Execute] Attempting to auto-format successfully patched file: %s with command: %s", res.Path, formatCmdStr)
+										formatCtx, formatCancel := context.WithTimeout(context.Background(), 15*time.Second)
+										formatResult, formatErr := app.Sandbox.Execute(formatCtx, sandbox.SandboxOptions{
+											Command:    formatCmdStr,
+											WorkingDir: app.Config.CWD,
+										})
+										formatCancel()
+										if formatErr != nil || formatResult.ExitCode != 0 {
+											formatErrMsg := fmt.Sprintf("[Direct Execute] Auto-formatting failed for %s.", res.Path)
+											if formatErr != nil {
+												formatErrMsg = fmt.Sprintf("%s Error: %v", formatErrMsg, formatErr)
+											} else {
+												formatErrMsg = fmt.Sprintf("%s Exit Code: %d, Stderr: %s", formatErrMsg, formatResult.ExitCode, formatResult.Stderr)
+											}
+											app.Logger.Log("ERROR: %s", formatErrMsg)
+											app.ChatModel.AddSystemMessage(formatErrMsg)
+										} else {
+											app.Logger.Log("[Direct Execute] Successfully auto-formatted %s.", res.Path)
+										}
+									} else {
+										app.Logger.Log("[Direct Execute] No formatter identified for file extension of %s, skipping auto-format.", res.Path)
+									}
+									// --- End: Auto-format successful patch ---
 								} else {
 									failureCount++
 								}
-								app.ChatModel.AddPatchResultMessage(res)
+								app.ChatModel.AddAgentPatchResultMessage(res)
 								app.ChatModel.ForceUpdateViewport()
 							}
 							if applyErr != nil {
@@ -821,15 +910,21 @@ func (app *App) needsApprovalForFunction(functionName string) bool {
 
 // askForApproval sets the state to show the approval UI instead of blocking
 func (app *App) askForApproval(functionName, argsToDisplay string, originalCall *agent.FunctionCall) {
-	app.Logger.Log("Setting state to ask for approval: Function=%s, Args=%q", functionName, argsToDisplay)
-	var title, description string
+	app.Logger.Log("Setting state to ask for approval: Function=%s", functionName)
+	var title, description, contentToDisplay string
+
+	contentToDisplay = argsToDisplay // Default to the raw args
+
 	switch functionName {
 	case "write_file":
 		title = "Approve File Write"
 		description = "The assistant wants to write to a file on your filesystem:"
 	case "patch_file":
 		title = "Approve File Patch"
-		description = "The assistant wants to modify a file using the following patch:"
+		description = "The assistant wants to modify file(s) using the following patch:"
+		// Format the patch content for display
+		app.Logger.Log("Formatting patch content for display...")
+		contentToDisplay = ui.FormatPatchForDisplay(argsToDisplay)
 	case "execute_command":
 		title = "Approve Command Execution"
 		description = "The assistant wants to execute the following shell command:"
@@ -838,15 +933,16 @@ func (app *App) askForApproval(functionName, argsToDisplay string, originalCall 
 		description = fmt.Sprintf("The assistant wants to perform the '%s' operation with arguments:", functionName)
 	}
 
-	app.approvalModel = ui.NewApprovalModel(title, description, argsToDisplay)
+	app.Logger.Log("Creating ApprovalModel. Title: %s, Desc: %s, Content Length: %d", title, description, len(contentToDisplay))
+	app.approvalModel = ui.NewApprovalModel(title, description, contentToDisplay)
 	app.isAwaitingApproval = true
 	app.pendingFunctionCall = originalCall  // Store the original call details
-	app.pendingApprovalArgs = argsToDisplay // Store the args shown to the user
+	app.pendingApprovalArgs = argsToDisplay // Store the *original*, unformatted args shown to the user
 
 	// Update UI immediately to show the prompt
+	// The message about the proposal should be added *before* calling askForApproval
 	app.ChatModel.SetThinkingStatus(fmt.Sprintf("Awaiting approval for %s...", functionName))
-	// No need to add system message here, the approval UI itself is the message
-	app.ChatModel.ForceUpdateViewport() // Force update might be needed if View logic depends on state
+	app.ChatModel.ForceUpdateViewport() // Force update to ensure prompt appears
 
 	// We don't return anything or block here
 	app.Logger.Log("Approval state set. Waiting for ui.ApprovalResultMsg.")
@@ -1081,4 +1177,41 @@ func (app *App) Close() error {
 
 	app.Logger.Log("App.Close: Cleanup complete")
 	return nil
+}
+
+// extractTargetFilesFromPatch is a simple helper to find // FILE: lines in a patch string
+func extractTargetFilesFromPatch(patchContent string) []string {
+	var files []string
+	lines := strings.Split(patchContent, "\n")
+	for _, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmedLine, "// FILE:") {
+			filename := strings.TrimSpace(strings.TrimPrefix(trimmedLine, "// FILE:"))
+			if filename != "" {
+				files = append(files, filename)
+			}
+		}
+	}
+	return files
+}
+
+// getFormatterCommand returns a suitable formatting command string for a given file path
+// based on its extension. Returns an empty string if no suitable formatter is known.
+func getFormatterCommand(filePath string) string {
+	ext := strings.ToLower(filepath.Ext(filePath))
+
+	switch ext {
+	case ".go":
+		// gofmt is built-in and standard
+		return fmt.Sprintf("gofmt -w %s", filePath)
+	case ".py":
+		// black is a very common and opinionated formatter
+		return fmt.Sprintf("black --quiet %s", filePath)
+	case ".js", ".jsx", ".ts", ".tsx", ".json", ".css", ".scss", ".html", ".yaml", ".yml", ".md":
+		// prettier is common for web/config files
+		return fmt.Sprintf("prettier --write --log-level=warn %s", filePath)
+	// Add cases for other languages as needed (e.g., rustfmt, clang-format)
+	default:
+		return ""
+	}
 }
