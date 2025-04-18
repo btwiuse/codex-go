@@ -1,6 +1,11 @@
 # Codex-Go
 
 A Go port of the OpenAI Codex CLI - a lightweight coding agent that runs in your terminal.
+4/18/2025 : WIP This project is under heavy development. Working on releasing a working build shortly with an updated read me
+
+- making it MCP server
+- Library
+- parity with original CODEX 
 
 ## Overview
 
