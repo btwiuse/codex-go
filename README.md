@@ -33,6 +33,63 @@ Currently, the primary focus is on the **In-Terminal Agent**.
 
 Pre-built binaries for Linux, macOS, and Windows are available on the [GitHub Releases](https://github.com/epuerta9/codex-go/releases) page.
 
+**One-Liner Install (Linux/macOS):**
+
+You can use the following commands to automatically download the latest release, extract it, and install it to `/usr/local/bin`. This requires `curl`, `tar`, and potentially `sudo` privileges.
+
+**Linux (amd64 / x86_64):**
+```bash
+curl -sL https://api.github.com/repos/epuerta9/codex-go/releases/latest \
+| grep "browser_download_url.*codex-go-linux-amd64.tar.gz" \
+| cut -d '"' -f 4 \
+| xargs curl -sL \
+| tar -xz -O codex-go > /tmp/codex-go && chmod +x /tmp/codex-go && sudo mv /tmp/codex-go /usr/local/bin/codex-go
+echo "codex-go installed to /usr/local/bin"
+```
+
+**Linux (arm64 / aarch64):**
+```bash
+curl -sL https://api.github.com/repos/epuerta9/codex-go/releases/latest \
+| grep "browser_download_url.*codex-go-linux-arm64.tar.gz" \
+| cut -d '"' -f 4 \
+| xargs curl -sL \
+| tar -xz -O codex-go > /tmp/codex-go && chmod +x /tmp/codex-go && sudo mv /tmp/codex-go /usr/local/bin/codex-go
+echo "codex-go installed to /usr/local/bin"
+```
+
+**macOS (amd64 / Intel):**
+```bash
+curl -sL https://api.github.com/repos/epuerta9/codex-go/releases/latest \
+| grep "browser_download_url.*codex-go-darwin-amd64.tar.gz" \
+| cut -d '"' -f 4 \
+| xargs curl -sL \
+| tar -xz -O codex-go > /tmp/codex-go && chmod +x /tmp/codex-go && sudo mv /tmp/codex-go /usr/local/bin/codex-go
+echo "codex-go installed to /usr/local/bin"
+```
+
+**macOS (arm64 / Apple Silicon):**
+```bash
+curl -sL https://api.github.com/repos/epuerta9/codex-go/releases/latest \
+| grep "browser_download_url.*codex-go-darwin-arm64.tar.gz" \
+| cut -d '"' -f 4 \
+| xargs curl -sL \
+| tar -xz -O codex-go > /tmp/codex-go && chmod +x /tmp/codex-go && sudo mv /tmp/codex-go /usr/local/bin/codex-go
+echo "codex-go installed to /usr/local/bin"
+```
+
+*(Note: If you prefer not to use `sudo` or install to `/usr/local/bin`, you can manually download the `.tar.gz` archive from the [Releases](https://github.com/epuerta9/codex-go/releases) page, extract it (`tar -xzf <archive_name>`), and move the `codex-go` binary to a directory in your `$PATH`.)*
+
+**Windows:**
+
+Manual installation is recommended for Windows:
+
+1.  Go to the [Latest Release](https://github.com/epuerta9/codex-go/releases/latest).
+2.  Download the `codex-go-windows-amd64.zip` file.
+3.  Extract the `codex-go.exe` binary.
+4.  Move `codex-go.exe` to a directory included in your system's `PATH` environment variable.
+
+**Manual Download & Extraction (Alternative):**
+
 1.  Go to the [Latest Release](https://github.com/epuerta9/codex-go/releases/latest).
 2.  Download the appropriate archive (`.tar.gz` or `.zip`) for your operating system and architecture.
 3.  Extract the `codex-go` binary from the archive.
